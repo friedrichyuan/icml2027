@@ -1,0 +1,26 @@
+accelerate
+aiohttp
+datasets
+dion @ git+https://github.com/microsoft/dion.git
+einops
+grpcio>=1.74.0
+huggingface_hub>=1.0.0
+jsonlines
+optree>=0.15.0
+packaging
+peft
+pylatexenc
+pynvml>=12.0.0
+ray[default]==2.59.0
+sympy
+tensorboard
+tokenizers>=0.23.2,<0.24.0
+torch
+torchdata
+torchmetrics
+tqdm
+transformers==5.18.0
+vllm
+vllm-router>=0.1.15
+wandb
+wheel

@@ -1,0 +1,273 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# molt — the project image: CUDA-13 (native CUDA 13; A100 sm_80, H100/H200 sm_90, B200 sm_100, and
+# GB200 sm_100 / GB300 sm_103 on aarch64 Grace hosts). One Dockerfile and one base for both CPU
+# architectures: the same file builds the amd64 and the arm64 image of a multi-arch tag.
+#
+# Base: OFFICIAL Docker Hub nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 (multi-arch; CUDA 13.0
+#   toolkit + cuDNN 9, Ubuntu 24.04) plus Ubuntu's python 3.12 and the cu130 torch 2.13.0 trio from
+#   download.pytorch.org, which ships x86_64 and aarch64 wheels. (pytorch/pytorch:2.13.0-cuda13.0-
+#   cudnn9-devel carries the same torch but publishes no arm64 manifest.)
+#   torch 2.13.0+cu130 matches vLLM 0.27–0.30's hard torch==2.13.0 pin — NO torch swap. The whole
+#   source stack (TE / flash-attn / mamba / DeepEP) is compiled against this torch, so the torch
+#   version and vLLM must stay in lockstep.
+#
+# Runs BOTH SFT and RL (vLLM) for omni3 (Nemotron-H Mamba2+MoE) and qwen3.6 (Qwen3.5-MoE).
+# System stack baked in: TE + flash-attn + DeepEP + mamba + fla + vLLM.
+# AutoModel is baked in too (the nemo-automodel pin from setup.py, MOLT_AUTOMODEL=upstream|slim),
+# so this image is SELF-CONTAINED — runnable as-is (e.g. pushed to Docker Hub) with no
+# external mount. At runtime the launch scripts OPTIONALLY prepend a sibling Automodel
+# checkout to PYTHONPATH; since PYTHONPATH is searched before site-packages, that dev
+# checkout transparently OVERRIDES the baked copy when present — both coexist, no conflict.
+#
+# Build (when docker is available):  docker build -f dockerfile/Dockerfile -t molt:cu13 .
+# The same command on an arm64 host builds the Grace-Blackwell image;
+#   docker buildx build --platform linux/amd64,linux/arm64 --push -t hijkzzz/molt:<ver> .
+# publishes one multi-arch tag that `docker pull` resolves per host.
+# (The bring-up was done via enroot on the cluster; see .tmp/cu13_build_steps.txt for the
+#  enroot-on-lustre import quirks, which are moot for a real docker build.)
+ARG BASE_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
+
+# Ubuntu 24.04 system python is PEP-668 "externally-managed" -> allow pip into it.
+# CUDA_HOME: the nvidia/cuda base does not set it (the earlier pytorch/pytorch base did), and
+# DeepEP's runtime JIT builds its nvcc command from it -> "/bin/nvcc: not found" on the first
+# MoE expert-parallel training step. Other JIT users (flashinfer, TE) also read it first.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    RDMA_CORE_HOME=/opt/rdma-core/build \
+    CUDA_HOME=/usr/local/cuda
+
+# python 3.12 site-packages. GPU arches: A100 sm_80 (Ampere) + H100/H200 sm_90 (Hopper) +
+# B200/GB200 sm_100 (Blackwell). ARCH_LIST / NVTE_CUDA_ARCHS drive the TE / flash-attn /
+# mamba / causal_conv1d source builds — all support Ampere, so sm_80 is included there.
+# DeepEP is Hopper+ ONLY: its kernels use Hopper wgmma/TMA + IBGDA and do NOT compile for
+# sm_80, so it builds against the narrower DEEPEP_ARCH_LIST. A100 therefore runs the
+# TE/flash-attn/mamba SFT + medium-inference path, not DeepEP expert-parallel.
+# GB300 (sm_103) runs the same lists: sm_100 SASS is binary-compatible within the major, and TE
+# compiles sm_100a + sm_103a itself from "100" (a generic 103 target trips its static asserts).
+ARG SITE=/usr/local/lib/python3.12/dist-packages
+ARG ARCH_LIST="8.0 9.0 10.0"
+ARG NVTE_CUDA_ARCHS="80;90;100"
+ARG DEEPEP_ARCH_LIST="9.0 10.0"
+
+# torch's bundled nvidia-*-cu13 wheels hold cudnn.h / nccl.h / cublas etc. The bare base
+# has no system NCCL/cuDNN dev headers, so every --no-build-isolation source build (TE,
+# flash-attn, mamba, DeepEP) must see them. NVTE_NCCL_HOME builds TE against torch's own
+# NCCL (do NOT apt-install libnccl-dev -> would mismatch the NCCL torch loads at runtime).
+ENV NCCL_HOME=${SITE}/nvidia/nccl \
+    NVTE_NCCL_HOME=${SITE}/nvidia/nccl \
+    CUDNN_HOME=${SITE}/nvidia/cudnn \
+    CUDNN_PATH=${SITE}/nvidia/cudnn
+
+# --- system packages ------------------------------------------------------------
+# Preseed UTC: the base already has tzdata; an apt upgrade of it runs an interactive
+# postinst that aborts under minimal debconf. Do NOT re-list tzdata in the install.
+RUN ln -snf /usr/share/zoneinfo/Etc/UTC /etc/localtime && echo Etc/UTC > /etc/timezone && \
+    echo 'tzdata tzdata/Areas select Etc' | debconf-set-selections && \
+    echo 'tzdata tzdata/Zones/Etc select UTC' | debconf-set-selections && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-dev python3-pip python-is-python3 \
+        build-essential gdb git gosu libomp-dev sudo \
+        libopenmpi-dev libnvidia-ml-dev ca-certificates \
+        pkg-config cython3 cmake ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- torch trio (cu130 wheels, both architectures) -------------------------------
+# Debian's pip/setuptools/wheel carry no RECORD and cannot be upgraded in place, so current ones are
+# layered over them. The trio is pinned to exactly what vLLM 0.29.0 requires.
+RUN python -m pip install --ignore-installed pip setuptools wheel && \
+    python -m pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+# --- pip tooling + source-build deps + dion -------------------------------------
+# --no-build-isolation builds use the system python, so their build + runtime deps must
+# exist first: pybind11/setuptools_scm/ninja/cmake (build), and pydantic/onnxscript/onnx/
+# importlib_metadata (TE 2.14's `import transformer_engine.pytorch` chain).
+# Pin the base torch trio up-front so no later install can swap it — esp. dion's transitive
+# deps (gram-newton-schulz->nvidia-cutlass-dsl, quack-kernels->torch-c-dlpack-ext) which can
+# otherwise pull a generic torch and poison the stack.
+RUN T=$(python -c "import torch; print(torch.__version__)") && \
+    TV=$(python -c "import torchvision; print(torchvision.__version__)") && \
+    TA=$(python -c "import torchaudio; print(torchaudio.__version__)") && \
+    printf 'torch==%s\ntorchvision==%s\ntorchaudio==%s\n' "$T" "$TV" "$TA" > /opt/torch-pin.txt && \
+    python -m pip install -c /opt/torch-pin.txt pybind11 setuptools_scm ninja cmake pydantic onnxscript onnx importlib_metadata && \
+    (python -m pip uninstall -y xgboost pynvml opencv-python-headless || true) && \
+    python -m pip install -c /opt/torch-pin.txt "dion @ git+https://github.com/microsoft/dion.git"
+
+# --- (a) Transformer Engine v2.19.0 (source; AutoModel main's TE_COMMIT and build flags) ----
+# --no-deps is REQUIRED (else pip hits ResolutionImpossible on torch). CPATH exposes torch's bundled
+# cudnn / nccl / mathdx headers; nvidia/cu13/include stays out: its CUDA runtime headers shadow the
+# toolkit's and nvcc 13.0's sm_103a host stubs then fail ("__cudaLaunch passed 2 arguments").
+# TE 2.19 dropped its cudnn-frontend submodule: setup.py needs the nvidia-cudnn-frontend wheel (header-only).
+ARG TE_COMMIT=v2.19.0
+RUN python -m pip install nvidia-mathdx==25.1.1 nvidia-cudnn-frontend==1.31.0 && \
+    git clone https://github.com/NVIDIA/TransformerEngine.git /opt/TransformerEngine && \
+    cd /opt/TransformerEngine && git fetch origin "${TE_COMMIT}" && git checkout FETCH_HEAD && \
+    git submodule update --init --recursive && \
+    CPATH="$(for d in ${SITE}/nvidia/*/include; do case "$d" in */cu13/include) ;; *) printf '%s:' "$d";; esac; done)${CPATH:-}" \
+    NVTE_FRAMEWORK=pytorch NVTE_RELEASE_BUILD=0 NVTE_BUILD_METAPACKAGE=0 NVTE_WITH_NCCL_EP=0 NVTE_NO_LOCAL_VERSION=1 \
+    NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_MAX_JOBS=8 NVTE_BUILD_THREADS_PER_JOB=8 \
+        python -m pip install --no-cache-dir --no-build-isolation --no-deps -v . && \
+    cd / && rm -rf /opt/TransformerEngine
+
+# --- (b) flash-attn 2.8.3 (source) ----------------------------------------------
+RUN git clone https://github.com/Dao-AILab/flash-attention.git /opt/flash-attention && \
+    cd /opt/flash-attention && git checkout v2.8.3 && \
+    CPATH="$(for d in ${SITE}/nvidia/*/include; do printf '%s:' "$d"; done)${CPATH:-}" \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=8 TORCH_CUDA_ARCH_LIST="${ARCH_LIST}" \
+        python -m pip install --no-build-isolation --no-deps . && \
+    cd / && rm -rf /opt/flash-attention
+
+# --- (d) causal_conv1d 1.6.2 + mamba_ssm 2.3.2.post1 (source) -------------------
+# CUDA 13 dropped cub::LaneId()/cub::CTA_SYNC(); rewrite to warp/block intrinsics before nvcc.
+RUN for repo in "https://github.com/Dao-AILab/causal-conv1d.git@v1.6.2@/opt/causal-conv1d@CAUSAL_CONV1D_FORCE_BUILD" \
+                "https://github.com/state-spaces/mamba.git@v2.3.2.post1@/opt/mamba@MAMBA_FORCE_BUILD"; do \
+        url="${repo%%@*}"; rest="${repo#*@}"; tag="${rest%%@*}"; rest="${rest#*@}"; dir="${rest%%@*}"; flag="${rest#*@}"; \
+        git clone "$url" "$dir" && cd "$dir" && git checkout "$tag" && \
+        find csrc -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.cpp' \) \
+            -exec sed -i -e 's/cub::LaneId()/(threadIdx.x \& 31u)/g' -e 's/cub::CTA_SYNC()/__syncthreads()/g' {} + && \
+        CPATH="$(for d in ${SITE}/nvidia/*/include; do printf '%s:' "$d"; done)${CPATH:-}" \
+        env "${flag}=TRUE" MAX_JOBS=8 TORCH_CUDA_ARCH_LIST="${ARCH_LIST}" \
+            python -m pip install --no-build-isolation --no-deps . && cd /; \
+    done && rm -rf /opt/causal-conv1d /opt/mamba
+
+# --- (c) DeepEP — AutoModel automodel_dep recipe (NVIDIA-NeMo/Automodel docker/Dockerfile) -----------
+# Same DeepEP commit and patch as the AutoModel pin: its HybridEP dispatcher (fused_a2a.py, molt's default
+# MOLT_MOE_DISPATCHER) is tested against this commit, which carries the HybridEP fixes (overflow flag
+# zero-init, ragged dispatch, C++ standard inherited from torch; #638's padding of max_num_of_tokens_per_rank
+# to the combine-kernel chunk size is included). deepep.patch is AutoModel's: CUDA 13 CCCL include dir,
+# nvidia-ml-py, and the NVSHMEM >= 3.5.19 RC-QP layout of the 3.6.5 wheel built against here.
+# The NVSHMEM wheel (3.6.5) MATCHES the apt rdma-core/libibverbs runtime (the prior 3.4.5-vs-source-rdma-core
+# mismatch made the cross-node EP>8 / EP16 internode IBGDA transport fail to init -> dispatch hang).
+# RDMA_CORE_HOME is symlinked to the system (apt) install so build==runtime libibverbs,
+# plus the libnvshmem_host.so->.so.3 + libmlx5.so->.so.1 symlinks DeepEP's fabric-handle
+# ops require. nvshmem cu13.
+COPY dockerfile/deepep.patch /opt/deepep.patch
+RUN apt-get update && apt-get install -y --allow-change-held-packages rdma-core libibverbs-dev && \
+    apt-get clean && \
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || echo x86_64-linux-gnu) && \
+    { test -f /usr/lib/${ARCH_LIB}/libmlx5.so || ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so; } && \
+    mkdir -p ${RDMA_CORE_HOME} && \
+    ln -sfn /usr/include ${RDMA_CORE_HOME}/include && \
+    ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib && \
+    git clone https://github.com/deepseek-ai/DeepEP.git /opt/DeepEP && \
+    cd /opt/DeepEP && \
+    git fetch origin 10d4dd7377d5bce900fbb4b80cce863764892b95 && git checkout FETCH_HEAD && \
+    patch -p1 < /opt/deepep.patch && \
+    python -m pip install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 && \
+    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | grep "Location:" | cut -d' ' -f2)/nvidia/nvshmem/lib && \
+    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so && \
+    env RDMA_CORE_HOME=${RDMA_CORE_HOME} HYBRID_EP_MULTINODE=1 \
+        LD_LIBRARY_PATH=/usr/local/cuda/lib64/:${LD_LIBRARY_PATH:-} \
+        CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl TORCH_CUDA_ARCH_LIST="${DEEPEP_ARCH_LIST}" MAX_JOBS=8 \
+        python -m pip install --no-cache-dir --no-build-isolation -v . && \
+    apt-get purge -y libnvidia-ml-dev && apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* /opt/deepep.patch && cd / && rm -rf /opt/DeepEP
+# RDMA_CORE_HOME=/opt/rdma-core/build symlinks to the system (apt) rdma-core at runtime.
+
+# --- (e) vLLM 0.32.0 (cu130) ----------------------------------------------------
+# Pin the base cu130 torch trio via a constraints file so pip can never swap it; let pip
+# pull vLLM's cu13 kernel deps (flashinfer-cu13, nvidia-cutlass-dsl, etc.).
+# vllm[audio] (not bare vllm): the official Nemotron-Omni GA model carries a Parakeet
+# sound_encoder; vLLM only builds it (so its audio weights LOAD instead of asserting
+# `self.sound_encoder is not None`) when the audio extra is present. Audio is unused for our
+# vision-only RL and the encoder is frozen — but the weights must load. Torch-pinned so the
+# [audio] extra (librosa/soundfile; torchaudio already in base) can't swap the torch trio.
+# Baking it here removes the per-run, per-node rl_omni3 MOLT_INSTALL_AUDIO install.
+RUN python -m pip install -c /opt/torch-pin.txt "vllm[audio]==0.32.0"
+
+# --- VLM modeling-code runtime deps + molt requirements + fla -----------
+# setup.py resolves requirements.txt plus the AutoModel source selected by MOLT_AUTOMODEL (upstream,
+# or slim for AutoModel-Slim); the grep drops what is already built above (torch trio, TE, flash-attn,
+# mamba/causal-conv1d, deepep, vllm, fla, ray, dion). Installed WITH deps but torch-pinned
+# (-c /opt/torch-pin.txt) so transitive deps (multiprocess, pyarrow, ...) come in without
+# swapping torch/the source-built stack. (--no-deps here would skip multiprocess -> SFT crash.)
+# AutoModel is baked in, so the image is self-contained (Docker Hub); the runtime PYTHONPATH
+# sibling-checkout override (above) takes precedence over this baked copy.
+# transformers is deliberately NOT pinned anywhere in this repo: AutoModel's exact pin wins here
+# (vLLM only sets a floor), so its validated transformers version travels with the AutoModel bump.
+ARG INSTALL_TEST_DEPS=0
+ARG MOLT_AUTOMODEL=upstream
+COPY setup.py requirements.txt /tmp/molt/
+RUN if [ "$INSTALL_TEST_DEPS" = "1" ]; then python -m pip install coverage pytest; fi && \
+    python -m pip install ftfy open_clip_torch timm wcwidth && \
+    cd /tmp/molt && MOLT_PRINT_REQUIREMENTS=1 MOLT_AUTOMODEL=$MOLT_AUTOMODEL python setup.py | \
+        grep -ivE '^[[:space:]]*(dion|vllm|torch|torchvision|torchaudio|transformer[-_]engine|flash[-_]attn|flash[-_]linear[-_]attention|fla([-_]core)?|mamba[-_]ssm|causal[-_]conv1d|deep[-_]ep|ray)([=<>!~ ]|$)' \
+        > /tmp/req.txt && cd / && \
+    python -m pip install -c /opt/torch-pin.txt -r /tmp/req.txt && \
+    python -m pip install "ray[default]==2.59.0" && \
+    python -m pip install --no-cache-dir --no-deps "flash-linear-attention==0.4.2" "fla-core==0.4.2" && \
+    python -c "import importlib.util as u; assert u.find_spec('fla.ops.cp') and u.find_spec('fla.modules.convolution') and u.find_spec('fla.ops.gated_delta_rule'), 'fla CP ops missing'" && \
+    rm -rf /tmp/molt /tmp/req.txt
+
+# DSA sparse attention (backend.attn="tilelang"): AutoModel's `cuda` extra. The pin is
+# load-bearing — 0.1.9 compiles the kernels but its backward NaNs once an index block mixes
+# real keys with the -1 sentinel, which causal top-k always produces. vLLM 0.28+ hard-pins
+# tilelang==0.1.12; this step deliberately downgrades it back (pip warns) — 0.1.12 is
+# unvalidated for the DSA backward, so keep this step AFTER the vLLM install.
+RUN python -m pip install --no-cache-dir "tilelang==0.1.12" "tile-kernels==1.0.0" "apache-tvm-ffi<=0.1.11"
+# Keep the kernel JIT cache under the bind-mounted /root/.cache; the default ~/.tilelang
+# is container-local, so every job would recompile the DSA kernels from scratch.
+ENV TILELANG_CACHE_DIR=/root/.cache/tilelang
+
+# vLLM 0.32 pins nvidia-cutlass-dsl 4.8.0 and quack-kernels 0.6.5; AutoModel's nemo-automodel metadata still asks for
+# quack 0.6.4 (cutlass 4.6.2), which the molt step above installed last. A 4.6.2 DSL under vLLM 0.32's CuTe router
+# GEMM fails MLIR verification at engine warmup on Hopper/Blackwell ("nvvm.mbarrier.arrive op operand count"), so
+# the runtime wins: re-pin both to vLLM's versions (quack 0.6.5 accepts cutlass >= 4.7). -c keeps the torch trio.
+RUN { cat /opt/torch-pin.txt; echo 'nvidia-cutlass-dsl==4.8.0'; } > /tmp/pin.txt && \
+    python -m pip install -c /tmp/pin.txt "nvidia-cutlass-dsl[cu13]==4.8.0" "quack-kernels==0.6.5" && rm -f /tmp/pin.txt
+
+# --- restore DeepEP's NVSHMEM ABI ----------------------------------------------
+# DeepEP (step c) built deep_ep_cpp.so against nvidia-nvshmem-cu13==3.6.5, but vLLM's dep set
+# can drag it back to ==3.4.5 (0.27.1 hard-pinned it; 0.28+ keeps it only transitively) ->
+# deep_ep_cpp.so then fails to load with
+# `undefined symbol: nvshmem_selected_device_transport, version NVSHMEM`. Force nvshmem back to
+# 3.6.5 as the LAST pip action (a backward-compatible superset: it keeps 3.4.5's symbols for
+# vLLM while restoring the newer one DeepEP needs). --no-deps so pip cannot re-drag the
+# older pin, and re-create the unversioned .so symlink the DeepEP step made.
+RUN python -m pip install --no-deps --force-reinstall nvidia-nvshmem-cu13==3.6.5 && \
+    NVSHMEM_LIB_PATH=$(pip show nvidia-nvshmem-cu13 | awk '/^Location:/{print $2}')/nvidia/nvshmem/lib && \
+    ln -sf ${NVSHMEM_LIB_PATH}/libnvshmem_host.so.3 ${NVSHMEM_LIB_PATH}/libnvshmem_host.so
+
+# Register torch's bundled nvidia libs on the loader path (vLLM pulls nvidia-* wheels),
+# plus z3's, which ships libz3 that tvm-ffi (tilelang) loads at import.
+RUN { find ${SITE}/nvidia -mindepth 2 -maxdepth 2 -type d -name lib | sort; echo ${SITE}/z3/lib; } \
+        > /etc/ld.so.conf.d/python-nvidia-libs.conf && ldconfig
+
+# --- CUDA forward compatibility -------------------------------------------------
+# Ship cuda-compat-13-0 (the CUDA 13.0 forward-compat libcuda) so the stack can run on Data
+# Center hosts whose NVIDIA kernel driver is older than 580 (native CUDA 13). It lands in
+# /usr/local/cuda/compat and is NOT on the loader path by default — docker-entrypoint.sh
+# prepends it at runtime only when the detected host driver is < 580, so native-driver hosts
+# are unaffected. (Do NOT ldconfig it in — that would force it on every host.)
+RUN apt-get update && apt-get install -y --no-install-recommends cuda-compat-13-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- build-time import self-check -----------------------------------------------
+# Fail the build if the installed stack can't import, so a dependency bump can't ship an image
+# that only crashes at a user's runtime — e.g. the quack-vs-cutlass-DSL drift that broke
+# `import mamba_ssm`. Every module below imports in the CPU-only builder; deep_ep is the lone
+# exception (needs libcuda at import) and is covered by the NVSHMEM restore step above.
+RUN python -c "import importlib; \
+[importlib.import_module(m) for m in ('torch','transformers','ray','nemo_automodel','quack','quack.layout_utils','fla','tilelang','tvm_ffi','vllm_router','transformer_engine.pytorch','flash_attn','causal_conv1d','mamba_ssm','flashinfer','vllm')]; \
+print('BUILD IMPORT CHECK OK')"
+
+# --- Entrypoint -----------------------------------------------------------------
+COPY dockerfile/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod a+x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

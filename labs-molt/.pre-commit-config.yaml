@@ -1,0 +1,40 @@
+default_language_version:
+  python: python3
+
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit suggestions'
+  autoupdate_schedule: quarterly
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: requirements-txt-fixer
+
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.3
+    hooks:
+      - id: autoflake
+        args: [--remove-all-unused-imports, --in-place]
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 8.0.1
+    hooks:
+      - id: isort
+        name: Format imports
+        exclude: docs/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.9.9"
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff
+        args: ["check", "--select", "I", "--fix"]
+      - id: ruff-format

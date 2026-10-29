@@ -1,0 +1,535 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import base64
+import inspect
+import io
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest import mock
+
+import aiohttp
+import numpy as np
+import pytest
+import ray
+
+from molt.trainer.rollout.router import (
+    AgentRunnerActor,
+    RouterGenerateClient,
+    VllmRouterActor,
+    _align_features_to_canonical,
+    _decode_routed_experts,
+    create_vllm_router,
+)
+
+GEN = "/inference/v1/generate"
+RENDER = "/v1/chat/completions/render"
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._p = payload
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self._p
+
+
+class _FakeCtx:
+    def __init__(self, payload):
+        self._p = payload
+
+    async def __aenter__(self):
+        return _FakeResp(self._p)
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeHttp:
+    """Routes POSTs by URL (render vs generate) and records calls."""
+
+    def __init__(self, by_url):
+        self.by_url = by_url
+        self.calls = []
+
+    def post(self, url, json=None, headers=None):
+        self.calls.append((url, json, headers))
+        return _FakeCtx(self.by_url[url])
+
+
+class _RaisingResp:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def raise_for_status(self):
+        raise self._exc
+
+    async def json(self):
+        return {}
+
+
+class _RaisingCtx:
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def __aenter__(self):
+        return _RaisingResp(self._exc)
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FlakyHttp:
+    """Fails the first ``fail_times`` POSTs with ``exc``, then serves ``payload``."""
+
+    def __init__(self, payload, exc, fail_times):
+        self.payload, self.exc, self.fail_times = payload, exc, fail_times
+        self.attempts = 0
+
+    def post(self, url, json=None, headers=None):
+        self.attempts += 1
+        return _RaisingCtx(self.exc) if self.attempts <= self.fail_times else _FakeCtx(self.payload)
+
+
+def _sp():
+    return SimpleNamespace(max_tokens=8, temperature=1.0, top_p=1.0)
+
+
+def _npy_b64(arr):
+    buf = io.BytesIO()
+    np.save(buf, np.asarray(arr))
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _content(ids):
+    # /inference/v1/generate logprobs=1 -> choice.logprobs.content[i] = {"token": "token_id:<id>", ...}
+    return [{"token": f"token_id:{t}", "logprob": -0.1 * (i + 1)} for i, t in enumerate(ids)]
+
+
+def _gen_resp(ids, routed=None, top_k=None):
+    content = _content(ids)
+    if top_k:  # a sampler head of top_k entries per token, the sampled token leading
+        for t, item in zip(ids, content):
+            item["top_logprobs"] = [{"token": f"token_id:{v}", "logprob": -1.0} for v in [t, *range(top_k - 1)]]
+    c = {"token_ids": ids, "finish_reason": {"type": "stop"}, "logprobs": {"content": content}}
+    if routed is not None:
+        c["routed_experts"] = routed
+    return {"choices": [c]}
+
+
+def test_generate_text_parses_choice_and_unified_routing():
+    # disagg carries a SINGLE unified [tokens,layer,topk] npy on the choice (prompt+gen by absolute
+    # position); absorb_routing lays it down from 0. No separate prompt_routed_experts (that split +
+    # JSON serialization was the /v1/completions R3 corruption). R3 return is enabled ENGINE-side, so
+    # the client just decodes whatever routed_experts the response carries — no per-request flag.
+    resp = _gen_resp([90, 91], routed=_npy_b64([[10], [11], [12], [20], [21]]))
+    ro, off = asyncio.run(RouterGenerateClient(_FakeHttp({GEN: resp})).generate([1, 2, 3], _sp()))
+    assert off == 0
+    assert ro.outputs[0].token_ids == [90, 91]
+    assert ro.prompt_routed_experts is None
+    assert ro.outputs[0].routed_experts.reshape(-1).tolist() == [10, 11, 12, 20, 21]
+    lp = ro.outputs[0].logprobs  # vLLM-shaped so _extract_generation_logprobs reads it unchanged
+    assert lp[0][90].logprob == pytest.approx(-0.1) and lp[1][91].logprob == pytest.approx(-0.2)
+
+
+def test_generate_posts_inference_endpoint_with_nested_sampling_params():
+    # Nothing set on SamplingParams should be silently dropped; they nest inside sampling_params with
+    # max_tokens + logprobs. skip_special_tokens is always sent; R3 off by default.
+    http = _FakeHttp({GEN: _gen_resp([9])})
+    sp = SimpleNamespace(max_tokens=8, temperature=0.7, top_p=0.9, top_k=20, min_tokens=5, skip_special_tokens=False)
+    asyncio.run(RouterGenerateClient(http).generate([1, 2], sp))
+    url, payload, _ = http.calls[0]
+    assert url == GEN and payload["token_ids"] == [1, 2]
+    spp = payload["sampling_params"]
+    assert spp["max_tokens"] == 8 and spp["logprobs"] == 1
+    assert (spp["temperature"], spp["top_p"], spp["top_k"], spp["min_tokens"]) == (0.7, 0.9, 20, 5)
+    assert spp["skip_special_tokens"] is False
+    assert "enable_return_routed_experts" not in spp
+
+
+def test_generate_raises_on_missing_logprobs():
+    resp = {"choices": [{"token_ids": [90], "finish_reason": "stop"}]}
+    with pytest.raises(RuntimeError, match="logprobs.content"):
+        asyncio.run(RouterGenerateClient(_FakeHttp({GEN: resp})).generate([1, 2], _sp()))
+
+
+def test_generate_raises_on_logprobs_count_mismatch():
+    resp = {"choices": [{"token_ids": [90, 91], "finish_reason": "stop", "logprobs": {"content": _content([90])}}]}
+    with pytest.raises(RuntimeError, match="!= completion tokens"):
+        asyncio.run(RouterGenerateClient(_FakeHttp({GEN: resp})).generate([1, 2], _sp()))
+
+
+def test_post_retries_transient_then_succeeds(monkeypatch):
+    # A refused/dropped connection (router/engine still warming up) is retried, not dropped.
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr("molt.trainer.rollout.router.asyncio.sleep", _no_sleep)
+    http = _FlakyHttp(_gen_resp([90]), aiohttp.ClientConnectionError("engine warming up"), fail_times=2)
+    ro, off = asyncio.run(RouterGenerateClient(http).generate([1, 2], _sp()))
+    assert http.attempts == 3 and ro.outputs[0].token_ids == [90]  # 2 transient failures, 3rd succeeds
+
+
+@pytest.mark.parametrize("path", [GEN, RENDER])
+@pytest.mark.parametrize("failed_attempts", [2, 3])
+def test_post_retries_interrupted_response_body(monkeypatch, path, failed_attempts):
+    payload = {"ok": True}
+    http = _FakeHttp({path: payload})
+    backoffs = []
+
+    async def read_body(response):
+        if len(http.calls) <= failed_attempts:
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+        return response._p
+
+    async def record_backoff(delay):
+        backoffs.append(delay)
+
+    monkeypatch.setattr(_FakeResp, "json", read_body)
+    monkeypatch.setattr("molt.trainer.rollout.router.asyncio.sleep", record_backoff)
+    request = RouterGenerateClient(http)._post(path, {"token_ids": [1, 2]}, "stable-session")
+    if failed_attempts == 3:
+        with pytest.raises(aiohttp.ClientPayloadError, match="not completed"):
+            asyncio.run(request)
+    else:
+        assert asyncio.run(request) == payload
+    assert len(http.calls) == 3
+    assert backoffs == [1, 2]
+    assert all(
+        call == (path, {"model": "policy", "token_ids": [1, 2]}, {"x-session-id": "stable-session"})
+        for call in http.calls
+    )
+
+
+def test_post_fails_fast_on_4xx(monkeypatch):
+    # A 4xx is a real client bug, not a transient — fail immediately without burning the retry budget.
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr("molt.trainer.rollout.router.asyncio.sleep", _no_sleep)
+    http = _FlakyHttp(_gen_resp([90]), aiohttp.ClientResponseError(None, (), status=400), fail_times=10)
+    with pytest.raises(aiohttp.ClientResponseError):
+        asyncio.run(RouterGenerateClient(http).generate([1, 2], _sp()))
+    assert http.attempts == 1
+
+
+def test_align_features_to_canonical_uses_image_token_run():
+    # render's mm_placeholders are DISCARDED (omni3 over-counts + its offset points at IMG_START, not
+    # the placeholder). We take offset+length from the run of image_token_id in the canonical prompt.
+    features = {"mm_placeholders": {"image": [{"offset": 8, "length": 274}]}}  # render's bogus range
+    _align_features_to_canonical(features, canonical=[1, 18, 18, 2], image_token_id=18)
+    assert features["mm_placeholders"]["image"][0] == {"offset": 1, "length": 2}
+
+
+def test_generate_vlm_renders_realigns_then_generates():
+    from PIL import Image
+
+    render_payload = {
+        "token_ids": [5, 18, 18, 18, 6],  # render's over-counted expansion (3 placeholders)
+        "features": {
+            "mm_placeholders": {"image": [{"offset": 1, "length": 3}]},
+            "kwargs_data": {"image": ["<b64-pixels>"]},
+            "mm_hashes": {"image": ["h0"]},
+        },
+    }
+    http = _FakeHttp({RENDER: render_payload, GEN: _gen_resp([90])})
+    canonical = [1, 18, 18, 2]  # our HF prompt: 2 image placeholders
+    ro, off = asyncio.run(
+        RouterGenerateClient(http, image_token_id=18).generate(
+            canonical, _sp(), multi_modal_data={"image": [Image.new("RGB", (4, 4))]}
+        )
+    )
+    assert http.calls[0][0] == RENDER  # render first (server-side mm)
+    gen_url, gen_payload, _ = http.calls[1]
+    assert gen_url == GEN
+    assert gen_payload["token_ids"] == canonical  # canonical HF ids, NOT render's 5-token prompt
+    ph = gen_payload["features"]["mm_placeholders"]["image"][0]
+    assert (ph["offset"], ph["length"]) == (1, 2)  # realigned to the canonical run
+    assert gen_payload["features"]["kwargs_data"]["image"] == ["<b64-pixels>"]  # embeds relayed verbatim
+    assert ro.outputs[0].token_ids == [90]
+
+
+def test_render_image_encoding_does_not_block_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_image_data_uri(_image):
+        started.set()
+        assert release.wait(timeout=1), "event loop could not release image encoding"
+        return "data:image/png;base64,image"
+
+    monkeypatch.setattr("molt.trainer.rollout.router._image_data_uri", _blocking_image_data_uri)
+    client = RouterGenerateClient(_FakeHttp({RENDER: {}}))
+
+    async def _run():
+        task = asyncio.create_task(client._render([object()], "session"))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+        await task
+
+    asyncio.run(_run())
+
+
+def test_generate_pins_render_and_generate_to_one_session():
+    # render + generate for a VLM call carry the SAME x-session-id: under consistent_hash that keeps them
+    # on one engine. The default cache_aware places them independently, which is safe only because the
+    # engines run with mm_processor_cache_gb=0 (render always returns full kwargs_data).
+    from PIL import Image
+
+    render_payload = {
+        "token_ids": [5, 18, 6],
+        "features": {
+            "mm_placeholders": {"image": [{"offset": 1, "length": 1}]},
+            "kwargs_data": {"image": ["b"]},
+            "mm_hashes": {"image": ["h"]},
+        },
+    }
+    http = _FakeHttp({RENDER: render_payload, GEN: _gen_resp([90])})
+    asyncio.run(
+        RouterGenerateClient(http, image_token_id=18).generate(
+            [1, 18, 2], _sp(), multi_modal_data={"image": [Image.new("RGB", (4, 4))]}
+        )
+    )
+    sid = (http.calls[0][2] or {}).get("x-session-id")
+    assert sid and (http.calls[1][2] or {}).get("x-session-id") == sid
+
+
+def test_align_features_multi_image_finds_separated_runs():
+    # Two images: each maps to its own image_token_id run in the canonical (markers separate them).
+    features = {"mm_placeholders": {"image": [{}, {}]}}  # 2 images; render offsets discarded
+    _align_features_to_canonical(features, canonical=[0, 18, 18, 9, 18, 18, 0], image_token_id=18)
+    ranges = features["mm_placeholders"]["image"]
+    assert (ranges[0]["offset"], ranges[0]["length"]) == (1, 2)
+    assert (ranges[1]["offset"], ranges[1]["length"]) == (4, 2)
+
+
+def test_decode_routed_experts_handles_both_encodings():
+    assert _decode_routed_experts(_npy_b64([[1], [2]])).tolist() == [[1], [2]]  # base64 .npy
+    assert _decode_routed_experts([[3], [4]]).tolist() == [[3], [4]]  # nested JSON lists
+
+
+def test_generate_routing_decode_does_not_block_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_decode(_blob):
+        started.set()
+        assert release.wait(timeout=1), "event loop could not release routing decode"
+        return np.asarray([[1]])
+
+    monkeypatch.setattr("molt.trainer.rollout.router._decode_routed_experts", _blocking_decode)
+    client = RouterGenerateClient(_FakeHttp({GEN: _gen_resp([90], routed="blob")}))
+
+    async def _run():
+        task = asyncio.create_task(client.generate([1], _sp()))
+        while not started.is_set():
+            await asyncio.sleep(0)
+        release.set()
+        result, _ = await task
+        assert result.outputs[0].routed_experts.tolist() == [[1]]
+
+    asyncio.run(_run())
+
+
+def test_agent_runner_actor_init_is_synchronous():
+    """Ray actor constructors are synchronous; an async __init__ would not be awaited."""
+    actor_cls = getattr(AgentRunnerActor, "__ray_actor_class__", AgentRunnerActor)
+    assert not inspect.iscoroutinefunction(actor_cls.__init__)
+
+
+def test_agent_runner_reports_each_failed_rollout():
+    class _FailingRunner:
+        async def execute(self, **kwargs):
+            raise RuntimeError("agent failed")
+
+    actor_cls = getattr(AgentRunnerActor, "__ray_actor_class__", AgentRunnerActor)
+    actor = object.__new__(actor_cls)
+    actor._runner = _FailingRunner()
+    actor._tokenizer = None
+    actor._client = None
+    actor._media_ids = set()
+
+    results = asyncio.run(actor.run_group("prompt", "label", None, SimpleNamespace(), 128, 2, group_id="group"))
+
+    assert results == [(None, "runner_error"), (None, "runner_error")]
+
+
+def test_agent_runner_drops_unconvertible_trajectory(monkeypatch):
+    from molt.trainer.rollout.samples_generator import SamplesGenerator
+
+    class _Runner:
+        async def execute(self, **kwargs):
+            return SimpleNamespace()
+
+    def _invalid(traj, media_ids, max_length):
+        raise ValueError("Invalid action range (0, 9) for trajectory length 4")
+
+    monkeypatch.setattr(SamplesGenerator, "_process_response_into_experience", staticmethod(_invalid))
+    actor_cls = getattr(AgentRunnerActor, "__ray_actor_class__", AgentRunnerActor)
+    actor = object.__new__(actor_cls)
+    actor._runner = _Runner()
+    actor._tokenizer = None
+    actor._client = None
+    actor._media_ids = set()
+
+    results = asyncio.run(actor.run_group("prompt", "label", None, SimpleNamespace(), 128, 2, group_id="group"))
+
+    # The conversion error is reported per rollout instead of failing the whole group task.
+    assert results == [(None, "convert_error"), (None, "convert_error")]
+
+
+class _FakeVllmEngine(BaseHTTPRequestHandler):
+    """Answers the router's worker probes and records which port served each generate."""
+
+    routes = []  # (first prompt token = rollout marker, engine port)
+
+    def _send_json(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._send_json(
+                {"object": "list", "data": [{"id": "policy", "object": "model", "created": 1, "owned_by": "t"}]}
+            )
+        else:
+            self._send_json({"status": "ok"})
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        self.routes.append((payload["token_ids"][0], self.server.server_port))
+        time.sleep(0.2)  # keep requests in flight so the router sees real load
+        self._send_json(_gen_resp([90]))
+
+    def log_message(self, *_):
+        pass
+
+
+@pytest.mark.integration
+def test_cache_aware_router_keeps_each_rollout_on_one_engine():
+    """Concurrent multi-turn rollouts spread over the engines, and every later turn (a token-prefix
+    extension of the previous one) returns to the engine that served the first, through the shipped
+    VllmRouterActor command line."""
+    pytest.importorskip("vllm_router")
+
+    engines = [ThreadingHTTPServer(("127.0.0.1", 0), _FakeVllmEngine) for _ in range(4)]
+    for engine in engines:
+        threading.Thread(target=engine.serve_forever, daemon=True).start()
+    actor_cls = getattr(VllmRouterActor, "__ray_actor_class__", VllmRouterActor)
+    router = actor_cls([f"http://127.0.0.1:{engine.server_port}" for engine in engines])
+
+    async def rollout(client, marker):
+        prompt = [marker, *range(1, 24)]
+        for _ in range(4):
+            out, _ = await client.generate(prompt, _sp(), session_id=f"rollout-{marker}")
+            prompt += [*out.outputs[0].token_ids, 7, 7, 7]  # action + observation extend the prefix
+
+    async def run(router_url):
+        async with aiohttp.ClientSession(base_url=router_url) as http:
+            await asyncio.gather(*(rollout(RouterGenerateClient(http), 1000 + i) for i in range(8)))
+
+    try:
+        asyncio.run(run(router.ready()))
+    finally:
+        router._proc.terminate()
+        router._proc.wait(timeout=10)
+        for engine in engines:
+            engine.shutdown()
+            engine.server_close()
+
+    served = {}
+    for marker, port in _FakeVllmEngine.routes:
+        served.setdefault(marker, set()).add(port)
+    assert len(_FakeVllmEngine.routes) == 32
+    assert all(len(ports) == 1 for ports in served.values()), served
+    assert len(set().union(*served.values())) > 1
+
+
+def test_router_command_line_carries_both_balance_thresholds():
+    """Both halves of the cache_aware trigger have to reach the subprocess: with only the absolute
+    one set, the ratio stays at the router's 1.5 and the gap it describes is never reached."""
+    cls = getattr(VllmRouterActor, "__ray_actor_class__", VllmRouterActor)
+    seen = {}
+
+    class _Popen:
+        def __init__(self, argv):
+            seen["argv"] = argv
+
+    with (
+        mock.patch("subprocess.Popen", _Popen),
+        mock.patch.object(ray.util, "get_node_ip_address", lambda: "127.0.0.1"),
+    ):
+        cls.__new__(cls).__init__(["http://127.0.0.1:1"], policy="cache_aware", balance=(7, 1.1))
+    argv = seen["argv"]
+    assert argv[argv.index("--balance-abs-threshold") + 1] == "7"
+    assert argv[argv.index("--balance-rel-threshold") + 1] == "1.1"
+    assert argv[argv.index("--policy") + 1] == "cache_aware"
+
+
+def test_router_balance_defaults_match_the_rollout_regime():
+    """The defaults are vime's, not the router's serving-fleet 64 / 1.5."""
+    cls = getattr(VllmRouterActor, "__ray_actor_class__", VllmRouterActor)
+    for fn in (cls.__init__, create_vllm_router):
+        assert inspect.signature(fn).parameters["balance"].default == (10, 1.2)
+
+
+def test_generate_forwards_logprobs_k_and_parses_top_logprobs_into_the_token_dict():
+    content = [
+        {
+            "token": "token_id:90",
+            "logprob": -0.1,
+            # 0.31.0 names a candidate only by the "token_id:<id>" string, >= 0.31.1 adds a token_id field
+            "top_logprobs": [
+                {"token": "token_id:90", "logprob": -0.1},
+                {"token": "x", "token_id": 7, "logprob": -2.0},
+            ],
+        }
+    ]
+    resp = {"choices": [{"token_ids": [90], "finish_reason": "stop", "logprobs": {"content": content}}]}
+    http = _FakeHttp({GEN: resp})
+    sp = SimpleNamespace(max_tokens=8, temperature=1.0, top_p=1.0, logprobs=2)
+
+    ro, _ = asyncio.run(RouterGenerateClient(http).generate([1, 2], sp))
+
+    assert http.calls[0][1]["sampling_params"]["logprobs"] == 2
+    assert ro.outputs[0].logprobs[0][90].logprob == pytest.approx(-0.1)  # the sampled token's dict, as before
+    ids, log_probs = ro.outputs[0].top_logprobs  # the sampler head as [n, k] arrays, engine order
+    assert ids.tolist() == [[90, 7]] and log_probs[0].tolist() == pytest.approx([-0.1, -2.0])
+
+
+def test_generate_skips_frontend_detokenization_unless_stop_strings_need_it():
+    http = _FakeHttp({GEN: _gen_resp([9], top_k=32)})
+    sp = SimpleNamespace(max_tokens=8, temperature=1.0, top_p=1.0, logprobs=32)
+    asyncio.run(RouterGenerateClient(http).generate([1, 2], sp))
+    spp = http.calls[0][1]["sampling_params"]
+    assert spp["detokenize"] is False and spp["flat_logprobs"] is True
+
+    http = _FakeHttp({GEN: _gen_resp([9])})
+    sp = SimpleNamespace(max_tokens=8, temperature=1.0, top_p=1.0, stop=["</answer>"])
+    asyncio.run(RouterGenerateClient(http).generate([1, 2], sp))
+    spp = http.calls[0][1]["sampling_params"]
+    assert "detokenize" not in spp and "flat_logprobs" not in spp and spp["stop"] == ["</answer>"]
