@@ -318,6 +318,19 @@ class BaseRLTrainer:
             self.best_eval_metric_value = checkpoint_metric_value
             self._latest_eval_metric_value = checkpoint_metric_value
 
+    def restore_turn_baseline(self, checkpoint_states) -> None:
+        """Resume the turn_linear regressor (weights, Adam, feature stats) saved with the actor."""
+        turn_baseline = self.experience_maker.turn_baseline
+        if turn_baseline is None or not checkpoint_states:
+            return
+        state = checkpoint_states.get("turn_baseline")
+        if state is None:
+            if checkpoint_states.get("global_step", 0) > 0:
+                logger.warning("Checkpoint has no turn_baseline state; the turn_linear baseline starts fresh.")
+            return
+        turn_baseline.load_state_dict(state)
+        logger.info(f"Restored turn_linear baseline ({turn_baseline.count} turns seen).")
+
     def fit(self, global_step: int = 0) -> None:
         raise NotImplementedError("fit method is not implemented")
 
@@ -432,6 +445,7 @@ class BaseRLTrainer:
 
         # Merge rollout stats (ground-truth, pre-dynamic-batch)
         status.update(rollout_stats)
+        status.update(getattr(self.experience_maker, "advantage_metrics", {}))
 
         status["generated_samples"] = sample0
         return status, global_step + 1
@@ -919,6 +933,8 @@ class TrainingActor(BaseRLTrainer):
             logger.info(f"Global step {global_step}: {log_status}")
 
             client_states.update({"global_step": global_step})
+            if self.experience_maker.turn_baseline is not None:
+                client_states["turn_baseline"] = self.experience_maker.turn_baseline.state_dict()
             self._latest_client_states = client_states
             self.save_logs_and_checkpoints(global_step, status, client_states)
 
@@ -1012,6 +1028,7 @@ class RLTrainer:
     def fit(self) -> None:
         checkpoint_states = ray.get(self.trainer_actor.load_checkpoint_states_or_default.remote())
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
+        ray.get(self.trainer_actor.restore_turn_baseline.remote(checkpoint_states))
 
         # .get with defaults: an interrupted save can leave model/ without extra_state.pt, so
         # load_ckpt returns states={} (weights load, scalars empty) — resume at 0, not KeyError.

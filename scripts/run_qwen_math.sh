@@ -138,4 +138,5 @@ python -u -m molt.cli.train_rl_ray \
   --ckpt.dcp_max_num 2 \
   --logger.logging_steps 1 \
   --logger.tensorboard_dir "$OUT/tb" \
+  "$@" \
   2>&1 | tee -a "$OUT/train.log"

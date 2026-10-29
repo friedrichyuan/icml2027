@@ -495,6 +495,21 @@ if __name__ == "__main__":
         "use --algo.advantage.estimator dr_grpo. Useful in single-rollout / async where the batch "
         "mean/std couple samples and are a noisy moving target.",
     )
+    parser.add_argument(
+        "--algo.advantage.flash_baseline",
+        type=str,
+        default="batch_mean",
+        choices=["batch_mean", "turn_linear"],
+        help="flash_reinforce baseline: batch_mean (A = R - mean(R), the original) or turn_linear "
+        "(A = R - b(s_turn): a linear regressor on pre-action turn features — turn index, earlier policy "
+        "tokens, prompt tokens — fit to the terminal reward by MSE after each batch's advantages are fixed).",
+    )
+    parser.add_argument(
+        "--algo.advantage.flash_baseline_lr",
+        type=float,
+        default=1e-2,
+        help="Adam learning rate of the turn_linear baseline regressor (one full-batch step per train step).",
+    )
     # Train/rollout (FSDP-actor vs vLLM) logprob-mismatch importance-sampling correction.
     parser.add_argument(
         "--algo.advantage.is_correction_level",
@@ -1105,6 +1120,9 @@ if __name__ == "__main__":
         assert args.rollout.n_samples_per_prompt > 1, (
             f"{args.algo.advantage.estimator} requires n_samples_per_prompt > 1"
         )
+
+    if args.algo.advantage.flash_baseline != "batch_mean" and args.algo.advantage.estimator != "flash_reinforce":
+        raise ValueError("--algo.advantage.flash_baseline only applies to --algo.advantage.estimator flash_reinforce.")
 
     if args.algo.kl.ref == "rollout" and args.algo.kl.use_loss and args.algo.kl.estimator == "k1":
         # The tokens came from the reference, so minimising log pi - log mu over them RAISES

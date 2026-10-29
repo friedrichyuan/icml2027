@@ -31,6 +31,13 @@ from molt.trainer.algorithm.advantage import (
     get_advantage_estimator,
 )
 from molt.trainer.algorithm.experience import Experience
+from molt.trainer.algorithm.turn_baseline import (
+    FEATURE_NAMES,
+    TurnLinearBaseline,
+    turn_features,
+    turn_metrics,
+    turn_spans,
+)
 from molt.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -115,6 +122,12 @@ class RemoteExperienceMaker:
         self.critic_model_group = critic_model_group
         self.tokenizer = tokenizer
         self.kl_ctl = kl_controller
+        # flash_reinforce with --algo.advantage.flash_baseline turn_linear: a learned per-turn
+        # baseline replaces the batch mean. Its state is checkpointed by the trainer.
+        self.turn_baseline = None
+        if getattr(self.args.algo.advantage, "flash_baseline", "batch_mean") == "turn_linear":
+            self.turn_baseline = TurnLinearBaseline(lr=self.args.algo.advantage.flash_baseline_lr)
+        self.advantage_metrics: dict = {}  # per-step baseline diagnostics, merged into the train status
 
     def build_experiences(self, rollout_samples: List[Experience]) -> List[Experience]:
         """Turn balanced rollout samples into train-ready experiences: recompute the log-probs and
@@ -281,6 +294,24 @@ class RemoteExperienceMaker:
         clip = args.reward.clip_range
         rewards = rewards.clamp(min=clip[0], max=clip[1]) if clip else rewards
 
+        # flash_reinforce: split every row into turns (contiguous action-token runs) with their
+        # pre-action features and terminal return. turn_linear predicts each turn's baseline with the
+        # regressor as it stood BEFORE this batch, broadcast onto that turn's tokens.
+        flash = self.advantage_estimator == "flash_reinforce"
+        baselines = None
+        if flash:
+            sample_spans = [row for exp in experiences for row in turn_spans(exp.action_mask)]
+            sample_rewards = rewards[rollouts["sample_to_rollout"]]
+            features = torch.cat([turn_features(spans) for spans in sample_spans])
+            turn_returns = torch.cat([sample_rewards[i].expand(len(s)) for i, s in enumerate(sample_spans)])
+            if self.turn_baseline is not None:
+                self.turn_baseline.update_feature_stats(features)
+                preds, spans_iter = iter(self.turn_baseline.predict(features).tolist()), iter(sample_spans)
+                baselines = [torch.zeros(exp.action_mask.shape, dtype=torch.float32) for exp in experiences]
+                for row in (row for b in baselines for row in b):
+                    for start, end in next(spans_iter):
+                        row[start:end] = next(preds)
+
         # PPO/gae is the only estimator that consumes a learned value baseline; the
         # critic filled exp.values during make_experience. Other estimators ignore it.
         needs_values = self.advantage_estimator == "gae"
@@ -294,8 +325,23 @@ class RemoteExperienceMaker:
             lam=args.algo.advantage.lam,
             values=[exp.values for exp in experiences] if needs_values else None,
             no_whiten=args.algo.advantage.no_whiten,
+            baselines=baselines,
         )
         advantages, returns = get_advantage_estimator(self.advantage_estimator)(rewards, rollouts["groups"], ctx)
+
+        if flash:
+            # Each turn's advantage is constant over its tokens; read it at the turn's first token.
+            rows = [adv[row] for adv in advantages for row in range(adv.size(0))]
+            turn_advantages = torch.tensor(
+                [row[start].item() for row, spans in zip(rows, sample_spans, strict=True) for start, _ in spans]
+            )
+            self.advantage_metrics = turn_metrics(features, turn_returns, turn_advantages)
+            if self.turn_baseline is not None:
+                # Fit only after this batch's advantages are fixed: one MSE step on its terminal returns.
+                self.turn_baseline.fit(features, turn_returns)
+                weights = self.turn_baseline.linear.weight.flatten().tolist()
+                self.advantage_metrics.update({f"baseline/w_{n}": w for n, w in zip(FEATURE_NAMES, weights)})
+                self.advantage_metrics["baseline/bias"] = self.turn_baseline.linear.bias.item()
 
         # Per-group reward std (on clipped rewards), broadcast to samples, for logging only.
         rollout_stds = torch.zeros_like(rewards)

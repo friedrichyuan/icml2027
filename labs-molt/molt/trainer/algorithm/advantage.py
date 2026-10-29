@@ -64,6 +64,8 @@ class AdvantageContext:
     kls: List[torch.Tensor]  # per experience (B, L) per-token KL
     values: List[torch.Tensor] | None = None  # per experience (B, L) critic V(s) at collection (PPO/gae)
     no_whiten: bool = False  # skip whitening entirely: raw returns (no mean-center, no std)
+    # per experience (B, L) detached per-turn baseline on action tokens (flash_reinforce turn_linear)
+    baselines: List[torch.Tensor] | None = None
 
 
 Estimator = Callable[
@@ -203,7 +205,16 @@ def flash_reinforce(
     """FlashREINFORCE: A_i = R_i - mean(R) over the WHOLE rollout batch (the n=1 regime
     has no prompt group to average), no whitening. For binary rewards this balances the
     positive and negative gradient mass; a batch with a single outcome class is a no-op step.
+
+    With ``ctx.baselines`` (``--algo.advantage.flash_baseline turn_linear``) the batch mean is
+    replaced by a learned per-turn baseline: A_{i,t} = R_i - b(s_{i,j(t)}).
     """
+    if ctx.baselines is not None:
+        sample_rewards = rewards[ctx.sample_to_rollout].split(ctx.exp_len)
+        returns = [
+            (r.unsqueeze(-1) - b) * mask for r, b, mask in zip(sample_rewards, ctx.baselines, ctx.action_masks)
+        ]
+        return [ret.clone() for ret in returns], returns
     advantages = rewards - rewards.mean()
     returns = broadcast_advantages(advantages, ctx)
     return [ret.clone() for ret in returns], returns
