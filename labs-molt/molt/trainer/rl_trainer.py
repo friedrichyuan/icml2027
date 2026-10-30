@@ -31,6 +31,7 @@ from molt.datasets import PromptDataset
 from molt.datasets.utils import blending_datasets
 from molt.trainer.algorithm.experience import balance_experiences
 from molt.trainer.algorithm.kl_controller import AdaptiveKLController, FixedKLController
+from molt.trainer.algorithm.replay import TrajectoryReplayBuffer, materialize
 from molt.trainer.fsdp import FsdpStrategy
 from molt.trainer.rollout.experience_maker import RemoteExperienceMaker, rollout_and_group_ids
 from molt.trainer.rollout.samples_generator import SamplesGenerator
@@ -301,6 +302,19 @@ class BaseRLTrainer:
         self.wandb_logger = WandbLogger(self.args) if self.args.logger.wandb.key else None
         self.tensorboard_logger = TensorboardLogger(self.args) if self.args.logger.tensorboard_dir else None
 
+        # --train.replay: K - 1 extra actor updates per new batch on buffered trajectories.
+        # learner_updates counts every actor optimizer step (fresh + replay); global_step keeps
+        # counting new batches, so eval/ckpt cadence and the LR schedule stay indexed by data.
+        replay = getattr(self.args.train, "replay", None)
+        self.replay_ratio = replay.update_ratio if replay is not None else 1
+        self.replay_buffer = None
+        self.learner_updates = 0
+        if self.replay_ratio > 1:
+            batch = self.args.rollout.batch_size * self.args.rollout.n_samples_per_prompt
+            self.replay_buffer = TrajectoryReplayBuffer(
+                replay.capacity or 8 * batch, replay.max_uses, replay.max_age, seed=self.args.train.seed
+            )
+
         # Best eval metric tracking
         self.best_eval_metric_value = float("-inf")
         self.best_eval_metric_key = getattr(self.args.ckpt, "best_metric_key", "") or ""
@@ -331,6 +345,59 @@ class BaseRLTrainer:
             return
         turn_baseline.load_state_dict(state)
         logger.info(f"Restored turn_linear baseline ({turn_baseline.count} turns seen).")
+
+    def restore_replay(self, checkpoint_states) -> None:
+        """Resume the replay buffer (trajectories, use counts, RNG) and the learner-update count."""
+        if getattr(self, "replay_buffer", None) is None or not checkpoint_states:
+            return
+        state = checkpoint_states.get("replay")
+        if state is None:
+            if checkpoint_states.get("global_step", 0) > 0:
+                logger.warning("Checkpoint has no replay state; the replay buffer starts empty.")
+            return
+        self.replay_buffer.load_state_dict(state["buffer"])
+        self.learner_updates = state["learner_updates"]
+        logger.info(f"Restored replay buffer ({len(self.replay_buffer.entries)} trajectories).")
+
+    def replay_updates(self, experiences) -> Dict:
+        """Buffer the batch just trained on, then run the K - 1 replay updates (replay.py)."""
+        buffer = self.replay_buffer
+        buffer.add(materialize(experiences), self.learner_updates)
+        self.learner_updates += 1  # the fresh update
+        evicted = buffer.evict(self.learner_updates)
+        status, rounds = {}, []
+        for _ in range(self.replay_ratio - 1):
+            picked = buffer.sample(len(experiences))
+            if picked is None:
+                break
+            status.update(buffer.stats(self.learner_updates, picked))
+            batch = balance_experiences([e.experience for e in picked], self.args)
+            ray.get(self.actor_model_group.async_run_method_batch(method_name="append", experience=batch))
+            rounds.append(self.policy_train())
+            for e in picked:
+                e.uses += 1
+            self.learner_updates += 1
+            for k, n in buffer.evict(self.learner_updates).items():
+                evicted[k] += n
+        status.update({f"replay_buffer/{k}": float(n) for k, n in evicted.items()})
+        for k in set().union(*rounds):
+            status[f"replay/{k}"] = statistics.fmean(r[k] for r in rounds if k in r)
+        status["replay/updates"] = float(len(rounds))
+        status["learner_updates"] = float(self.learner_updates)
+        status.update(buffer.stats(self.learner_updates))
+        return status
+
+    def partial_reset(self, new_batches: int) -> Dict:
+        """--train.reset: on schedule, shrink the selected params toward their RL-start values
+        and/or clear their Adam state, before this step's weights are published to vLLM."""
+        reset = self.args.train.reset
+        if new_batches < reset.start or (new_batches - reset.start) % reset.interval:
+            return {}
+        shrink = reset.mode == "shrink"
+        refs = self.actor_model_group.async_run_method(
+            method_name="partial_reset", eps=reset.eps if shrink else 0.0, shrink=shrink
+        )
+        return ray.get(refs)[0]
 
     def verify_length_weight(self, checkpoint_states) -> None:
         """A resumed run must keep the length-weight constants it was frozen with."""
@@ -435,6 +502,16 @@ class BaseRLTrainer:
         status = self.policy_train(train_actor=not actor_frozen)
         status["actor_frozen"] = float(actor_frozen)
         policy_train_time = time.time() - t0
+        if getattr(self, "replay_buffer", None) is not None and not actor_frozen:
+            t0 = time.time()
+            status.update(self.replay_updates(experiences))
+            status["timing/replay_train"] = time.time() - t0
+        if getattr(getattr(self.args.train, "reset", None), "mode", "off") != "off":
+            t0 = time.time()
+            reset_status = self.partial_reset(global_step + 1)
+            if reset_status:
+                status.update(reset_status)
+                status["timing/reset"] = time.time() - t0
 
         # Sync weights to vLLM (skipped while the actor is frozen: its weights are
         # unchanged, so the live vLLM copy is already current).
@@ -963,6 +1040,11 @@ class TrainingActor(BaseRLTrainer):
                 client_states["turn_baseline"] = self.experience_maker.turn_baseline.state_dict()
             if getattr(self.experience_maker, "length_weight", None) is not None:
                 client_states["length_weight"] = self.experience_maker.length_weight.state_dict()
+            if self.replay_buffer is not None:
+                client_states["replay"] = {
+                    "buffer": self.replay_buffer.state_dict(),
+                    "learner_updates": self.learner_updates,
+                }
             self._latest_client_states = client_states
             self.save_logs_and_checkpoints(global_step, status, client_states)
 
@@ -1058,6 +1140,7 @@ class RLTrainer:
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
         ray.get(self.trainer_actor.restore_turn_baseline.remote(checkpoint_states))
         ray.get(self.trainer_actor.verify_length_weight.remote(checkpoint_states))
+        ray.get(self.trainer_actor.restore_replay.remote(checkpoint_states))
 
         # .get with defaults: an interrupted save can leave model/ without extra_state.pt, so
         # load_ckpt returns states={} (weights load, scalars empty) — resume at 0, not KeyError.

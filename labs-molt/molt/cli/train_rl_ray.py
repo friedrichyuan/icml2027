@@ -267,6 +267,9 @@ def train(args):
     # `max_steps` would shift its warmup/decay and never reach min_lr. The critic
     # trains every step, so it keeps the full `max_steps`.
     actor_max_steps = max(1, max_steps - (args.actor.freezing_steps if has_critic else 0))
+    # Replay takes K optimizer steps per new batch; stretching the schedule keeps the LR at new
+    # batch n equal to the K = 1 run's.
+    actor_max_steps *= args.train.replay.update_ratio
 
     # init actor/reference models
     refs = []
@@ -936,6 +939,39 @@ if __name__ == "__main__":
     parser.add_argument("--train.max_epochs", type=int, default=1)
     parser.add_argument("--train.num_episodes", type=int, default=1)
     parser.add_argument("--train.seed", type=int, default=42)
+    # Trajectory replay + partial reset (molt/trainer/algorithm/replay.py).
+    parser.add_argument(
+        "--train.replay.update_ratio",
+        type=int,
+        default=1,
+        help="K = actor updates per new batch; K - 1 replay updates on B buffered trajectories. 1 = off.",
+    )
+    parser.add_argument(
+        "--train.replay.capacity", type=int, default=0, help="Buffer size in trajectories (0 = 8 x batch)."
+    )
+    parser.add_argument(
+        "--train.replay.max_uses", type=int, default=4, help="Updates a trajectory may take, first included."
+    )
+    parser.add_argument(
+        "--train.replay.max_age", type=int, default=32, help="Learner updates since first use before eviction."
+    )
+    parser.add_argument(
+        "--train.reset.mode",
+        choices=["off", "shrink", "optim_only"],
+        default="off",
+        help="shrink: theta_S <- (1-eps) theta_S + eps theta_S0 and clear S's Adam state; "
+        "optim_only: clear S's Adam state only (the control).",
+    )
+    parser.add_argument("--train.reset.eps", type=float, default=0.01, help="Shrink weight toward theta_S0.")
+    parser.add_argument("--train.reset.start", type=int, default=64, help="First reset after this many new batches.")
+    parser.add_argument("--train.reset.interval", type=int, default=64, help="New batches between resets.")
+    parser.add_argument(
+        "--train.reset.params",
+        type=str,
+        default="*.o_proj.weight",
+        help="fnmatch pattern over actor parameter names selecting S (activation checkpointing inserts "
+        "'_checkpoint_wrapped_module.' into the names, so avoid anchoring on the parent module).",
+    )
     parser.add_argument(
         "--train.full_determinism_enable",
         action="store_true",
@@ -1355,6 +1391,24 @@ if __name__ == "__main__":
             "epochs over each rollout, and on-policy training must take exactly one pass — any epoch "
             "after the first trains on data the (now updated) weights did not generate."
         )
+
+    if args.train.replay.update_ratio < 1:
+        raise ValueError("--train.replay.update_ratio must be >= 1.")
+    if args.train.replay.update_ratio > 1 and not (
+        args.train.force_on_policy and args.algo.kl.init_coef == 0 and args.algo.advantage.estimator != "gae"
+    ):
+        # Each update recomputes old log-probs in its own forward (ratio 1, IS/gate vs the frozen
+        # rollout log-probs); precomputed old log-probs or values would be stale on replay.
+        raise ValueError(
+            "--train.replay needs --train.force_on_policy, --algo.kl.init_coef 0 and a critic-free estimator."
+        )
+    if args.train.reset.mode != "off":
+        if args.train.reset.mode == "shrink" and not 0 < args.train.reset.eps <= 1:
+            raise ValueError("--train.reset.eps must be in (0, 1].")
+        if args.train.reset.interval < 1 or args.train.reset.start < 1:
+            raise ValueError("--train.reset.start and --train.reset.interval must be >= 1.")
+        if args.actor.lora_dim > 0 or args.fsdp.offload != "none":
+            raise ValueError("--train.reset supports full-parameter FSDP training with GPU-resident Adam state.")
 
     assert (
         args.rollout.n_samples_per_prompt * args.rollout.batch_size // args.rollout.micro_batch_size

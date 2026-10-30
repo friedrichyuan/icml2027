@@ -3,8 +3,9 @@
 python scripts/compare_runs.py outputs/qwen-math-1.5b outputs/qwen-math-1.5b-turn_linear [--upto 1200]
 
 Steps beyond --upto are ignored so runs at different progress compare on the same budget: a
-fixed number of rollouts (--upto), of cumulative generated tokens (--budget_tokens, millions) or
-of training wall-clock (--budget_hours). A restarted log keeps the last record of each step.
+fixed number of rollouts (--upto), of cumulative generated tokens (--budget_tokens, millions), of
+training wall-clock (--budget_hours) or of actor-update time (--budget_train_hours, the compute
+axis replay spends more of). A restarted log keeps the last record of each step.
 """
 
 import argparse
@@ -27,7 +28,20 @@ LENGTH_KEYS = (
     "lw/at_max_frac",
     "lw/long_fail_share_unweighted",
     "lw/long_fail_share_weighted",
+    "is_filter_ratio",
+    "replay/is_filter_ratio",
+    "vllm_kl",
+    "replay/vllm_kl",
+    "replay/actor_grad_norm",
+    "replay/age_mean",
+    "replay/uses_mean",
+    "replay/updates",
+    "replay_buffer/size",
 )
+
+
+def train_hours(r):
+    return (r.get("timing/policy_train", 0.0) + r.get("timing/replay_train", 0.0)) / 3600
 
 
 def load(run: Path):
@@ -44,22 +58,24 @@ def mean(values):
     return statistics.fmean(values) if values else float("nan")
 
 
-def budget_step(steps, budget_tokens, budget_hours):
-    """The last step whose cumulative generated tokens (M) and wall-clock (h) are within budget."""
-    tokens = hours = 0.0
+def budget_step(steps, budget_tokens, budget_hours, budget_train_hours):
+    """The last step whose cumulative generated tokens (M), wall-clock (h) and actor-update time (h)
+    are all within budget."""
+    tokens = hours = trained = 0.0
     last = 0
     for step, r in sorted(steps.items()):
         tokens += r["rollout/response_length_mean"] * r["rollout/num_samples"] / 1e6
         hours += r["timing/step_total"] / 3600
-        if tokens > budget_tokens or hours > budget_hours:
+        trained += train_hours(r)
+        if tokens > budget_tokens or hours > budget_hours or trained > budget_train_hours:
             break
         last = step
     return last
 
 
-def summarize(run: Path, upto: int, budget_tokens: float, budget_hours: float):
+def summarize(run: Path, upto: int, budget_tokens: float, budget_hours: float, budget_train_hours: float):
     steps, evals = load(run)
-    upto = min(upto, budget_step(steps, budget_tokens, budget_hours))
+    upto = min(upto, budget_step(steps, budget_tokens, budget_hours, budget_train_hours))
     steps = {k: v for k, v in sorted(steps.items()) if k <= upto}
     evals = {k: v for k, v in sorted(evals.items()) if k <= upto}
     if not steps:
@@ -72,6 +88,9 @@ def summarize(run: Path, upto: int, budget_tokens: float, budget_hours: float):
         "rollouts (cum)": sum(r["rollout/num_rollouts"] for r in rows),
         "gen tokens M (cum)": sum(r["rollout/response_length_mean"] * r["rollout/num_samples"] for r in rows) / 1e6,
         "wall-clock h (cum)": sum(r["timing/step_total"] for r in rows) / 3600,
+        "actor updates (cum)": sum(1 + r.get("replay/updates", 0.0) for r in rows),
+        "actor-train h (cum)": sum(train_hours(r) for r in rows),
+        "resets": sum(r.get("reset/applied", 0.0) for r in rows),
         "reward(last100)": mean([r["reward"] for r in rows[-100:]]),
         "grad_norm mean": mean(grad),
         "grad_norm std": statistics.pstdev(grad),
@@ -99,8 +118,13 @@ def main():
     parser.add_argument("--upto", type=int, default=10**9, help="last global step to include")
     parser.add_argument("--budget_tokens", type=float, default=float("inf"), help="cumulative generated tokens (M)")
     parser.add_argument("--budget_hours", type=float, default=float("inf"), help="cumulative step wall-clock (h)")
+    parser.add_argument(
+        "--budget_train_hours", type=float, default=float("inf"), help="cumulative actor-update time (h)"
+    )
     args = parser.parse_args()
-    summaries = [summarize(run, args.upto, args.budget_tokens, args.budget_hours) for run in args.runs]
+    summaries = [
+        summarize(run, args.upto, args.budget_tokens, args.budget_hours, args.budget_train_hours) for run in args.runs
+    ]
     keys = list(dict.fromkeys(k for s in summaries for k in s))
     width = max(map(len, keys))
     for key in keys:

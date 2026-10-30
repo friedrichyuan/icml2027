@@ -16,6 +16,7 @@
 # Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
+import fnmatch
 import os
 import socket
 import time
@@ -949,6 +950,19 @@ class PolicyModelActor(BaseModelActor):
         }
         self.actor, self.actor_optim, self.actor_scheduler = strategy.prepare((actor, actor_cfg))
 
+        # --train.reset: the selected params' local FSDP shards at RL start, taken before any
+        # checkpoint load so a resumed run shrinks toward the same pretrained values.
+        self._reset_params = {}
+        reset = getattr(args.train, "reset", None)
+        if reset is not None and reset.mode != "off":
+            for name, param in self.actor.model.named_parameters():
+                if param.requires_grad and fnmatch.fnmatch(name, reset.params):
+                    local = getattr(param, "_local_tensor", param)  # FSDP2 DTensor -> this rank's shard
+                    self._reset_params[name] = (param, local.detach().clone() if reset.mode == "shrink" else None)
+            if not self._reset_params:
+                raise ValueError(f"--train.reset.params {reset.params!r} matches no trainable actor parameter")
+            strategy.print(f"[reset] {len(self._reset_params)} params match {reset.params!r} ({reset.mode})")
+
         # load checkpoint
         self.checkpoint_states = {}
         ckpt_path = os.path.join(args.ckpt.path, "_actor")
@@ -1040,6 +1054,31 @@ class PolicyModelActor(BaseModelActor):
 
     def broadcast_to_vllm(self):
         self.trainer.broadcast_to_vllm()
+
+    @torch.no_grad()
+    def partial_reset(self, eps: float, shrink: bool) -> dict:
+        """theta_S <- (1 - eps) theta_S + eps theta_S0 (shrink), and zero S's Adam moments and step
+        (a fresh-Adam restart for S; the other params' state and the LR schedule are untouched)."""
+        drift_sq = 0.0
+        for param, init in self._reset_params.values():
+            if shrink:
+                local = getattr(param, "_local_tensor", param)
+                drift_sq += (local.double() - init.double()).pow(2).sum().item()
+                local.mul_(1.0 - eps).add_(init, alpha=eps)
+            state = self.actor_optim.state.get(param, {})
+            for key in ("exp_avg", "exp_avg_sq", "step"):
+                if torch.is_tensor(state.get(key)):
+                    state[key].zero_()
+        device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+        drift_sq = torch.tensor(drift_sq, dtype=torch.float64, device=device)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(drift_sq)
+        return {
+            "reset/applied": 1.0,
+            "reset/num_params": float(len(self._reset_params)),
+            "reset/eps": eps,
+            "reset/drift_norm_before": drift_sq.sqrt().item(),
+        }
 
     def get_checkpoint_states(self):
         return self.checkpoint_states
