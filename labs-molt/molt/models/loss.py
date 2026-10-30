@@ -371,9 +371,12 @@ class PolicyLoss(nn.Module):
         prompt_token_counts: Optional[torch.Tensor] = None,
         top_log_probs: Optional[torch.Tensor] = None,
         rollout_top_log_probs: Optional[torch.Tensor] = None,
+        seq_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``top_log_probs`` / ``rollout_top_log_probs`` are ``[B, T-1, k]``: the trained policy's and
-        the sampler's log-probs of the sampler's top-k ids per step (score centering only)."""
+        the sampler's log-probs of the sampler's top-k ids per step (score centering only).
+        ``seq_weights`` ``[B]`` (detached) scales each sequence's policy-gradient term before the
+        aggregation, which keeps its token and batch denominators (``--algo.length_weight``)."""
         log_ratio_limit = 30.0
         policy_log_ratio = torch.nan_to_num(
             log_probs.float() - old_log_probs.float(),
@@ -492,6 +495,8 @@ class PolicyLoss(nn.Module):
         # a fraction-of-window, not a per-token mean — so we report this instead
         # to keep logged values interpretable and comparable across configs.
         reported_loss = masked_mean(loss.detach(), action_mask, dim=None)
+        if seq_weights is not None:
+            loss = loss * seq_weights.detach().to(loss.dtype).unsqueeze(-1)
 
         if self.token_level_loss:
             loss = agg_loss(

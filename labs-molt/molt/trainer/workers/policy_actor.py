@@ -33,6 +33,7 @@ from tqdm import tqdm
 from molt.models import Actor, PolicyLoss, agg_loss
 from molt.models.utils import compute_approx_kl, masked_mean, mismatch_metrics, split_moe_aux_loss
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
+from molt.trainer.algorithm.length_weight import LengthWeight
 from molt.trainer.fsdp import FsdpStrategy
 from molt.trainer.fsdp.refit import gather_full_param
 from molt.utils import get_tokenizer
@@ -143,6 +144,9 @@ class PolicyTrainer:
             is_correction_gating=self.args.algo.advantage.is_correction_gating,
             score_centering=self.args.algo.advantage.score_centering_top_k > 0,
         )
+        # --algo.length_weight: frozen per-trajectory weight on the policy-gradient term only
+        # (entropy / KL / aux losses stay unweighted). Constants were calibrated by the CLI.
+        self.length_weight = LengthWeight.from_args(getattr(self.args.algo, "length_weight", None))
 
         # Add the MoE router load-balancing aux loss only when its coefficient is set.
         self.aux_loss = self.args.actor.aux_loss_coef > 1e-8
@@ -510,6 +514,8 @@ class PolicyTrainer:
             prompt_token_counts=prompt_token_counts,
             top_log_probs=model_output.get("action_top_log_probs"),
             rollout_top_log_probs=rollout_top_log_probs,
+            # T_i: the row's original policy-token count, before the IS gate drops any token.
+            seq_weights=self.length_weight(action_mask.sum(-1)) if self.length_weight is not None else None,
         )
         experience.info["policy_clip_ratio"] = clip_ratio.detach()
         experience.info["policy_kl"] = policy_kl.detach()

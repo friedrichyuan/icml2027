@@ -510,6 +510,55 @@ if __name__ == "__main__":
         default=1e-2,
         help="Adam learning rate of the turn_linear baseline regressor (one full-batch step per train step).",
     )
+    # Fixed per-trajectory length weight on the policy-gradient term: w_i = clip((T_i/T0)^(1-alpha),
+    # min, max) / c, with T0 and c frozen from a reference length sample (length_weight.py).
+    parser.add_argument(
+        "--algo.length_weight.enabled",
+        action="store_true",
+        default=False,
+        help="Scale each trajectory's policy-gradient term by the frozen length weight w_i "
+        "(needs --actor.loss_agg_mode seq-mean-token-mean; entropy/KL terms stay unweighted).",
+    )
+    parser.add_argument(
+        "--algo.length_weight.alpha",
+        type=float,
+        default=1.0,
+        help="1 = plain Flash; < 1 up-weights long trajectories, > 1 down-weights them.",
+    )
+    parser.add_argument(
+        "--algo.length_weight.reference_file",
+        type=str,
+        default=None,
+        help="JSON reference length sample (list, or {'lengths': [...]}); T0 = its median, c = mean raw weight. "
+        "Build one with scripts/build_length_reference.py from a --logger.rollout_lengths_file dump.",
+    )
+    parser.add_argument(
+        "--algo.length_weight.reference_length",
+        type=float,
+        default=None,
+        help="T0; filled from --reference_file, or given directly (then --calibration_scale is required too).",
+    )
+    parser.add_argument("--algo.length_weight.raw_weight_min", type=float, default=0.5, help="u_min (clip on raw u)")
+    parser.add_argument("--algo.length_weight.raw_weight_max", type=float, default=2.0, help="u_max (clip on raw u)")
+    parser.add_argument(
+        "--algo.length_weight.calibration_scale",
+        type=float,
+        default=None,
+        help="c = mean raw weight on the reference sample; filled from --reference_file or given directly.",
+    )
+    parser.add_argument(
+        "--algo.length_weight.reference_stats_id",
+        type=str,
+        default=None,
+        help="Content hash of the reference sample; filled from --reference_file (checked if also given).",
+    )
+    parser.add_argument(
+        "--logger.rollout_lengths_file",
+        type=str,
+        default=None,
+        help="Append one JSON line per train step with every generated sample's policy-token count, reward "
+        "and truncation flag (the source for a --algo.length_weight.reference_file).",
+    )
     # Train/rollout (FSDP-actor vs vLLM) logprob-mismatch importance-sampling correction.
     parser.add_argument(
         "--algo.advantage.is_correction_level",
@@ -1123,6 +1172,32 @@ if __name__ == "__main__":
 
     if args.algo.advantage.flash_baseline != "batch_mean" and args.algo.advantage.estimator != "flash_reinforce":
         raise ValueError("--algo.advantage.flash_baseline only applies to --algo.advantage.estimator flash_reinforce.")
+
+    lw = args.algo.length_weight
+    if lw.enabled:
+        from molt.trainer.algorithm.length_weight import LengthWeight, load_reference_lengths
+
+        if args.actor.loss_agg_mode != "seq-mean-token-mean":
+            raise ValueError("--algo.length_weight is defined on --actor.loss_agg_mode seq-mean-token-mean.")
+        if not 0 < lw.raw_weight_min <= lw.raw_weight_max:
+            raise ValueError("--algo.length_weight needs 0 < raw_weight_min <= raw_weight_max.")
+        if lw.reference_file:
+            frozen = LengthWeight.calibrate(
+                load_reference_lengths(lw.reference_file), lw.alpha, lw.raw_weight_min, lw.raw_weight_max
+            )
+            for key in ("reference_length", "calibration_scale", "reference_stats_id"):
+                given, value = getattr(lw, key), getattr(frozen, key)
+                if given is not None and (given != value if isinstance(value, str) else abs(given - value) > 1e-6):
+                    raise ValueError(f"--algo.length_weight.{key}={given} disagrees with the reference file ({value}).")
+                setattr(lw, key, value)
+        if lw.reference_length is None or lw.calibration_scale is None:
+            raise ValueError(
+                "--algo.length_weight needs --reference_file, or both --reference_length and --calibration_scale."
+            )
+        print(
+            f"[LengthWeight] alpha={lw.alpha} T0={lw.reference_length} c={lw.calibration_scale} "
+            f"u in [{lw.raw_weight_min}, {lw.raw_weight_max}] reference={lw.reference_stats_id}"
+        )
 
     if args.algo.kl.ref == "rollout" and args.algo.kl.use_loss and args.algo.kl.estimator == "k1":
         # The tokens came from the reference, so minimising log pi - log mu over them RAISES

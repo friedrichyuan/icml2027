@@ -31,6 +31,7 @@ from molt.trainer.algorithm.advantage import (
     get_advantage_estimator,
 )
 from molt.trainer.algorithm.experience import Experience
+from molt.trainer.algorithm.length_weight import LengthWeight, length_metrics
 from molt.trainer.algorithm.turn_baseline import (
     FEATURE_NAMES,
     TurnLinearBaseline,
@@ -128,6 +129,9 @@ class RemoteExperienceMaker:
         if getattr(self.args.algo.advantage, "flash_baseline", "batch_mean") == "turn_linear":
             self.turn_baseline = TurnLinearBaseline(lr=self.args.algo.advantage.flash_baseline_lr)
         self.advantage_metrics: dict = {}  # per-step baseline diagnostics, merged into the train status
+        # --algo.length_weight: the actor applies the weight; the controller logs length/weight
+        # diagnostics and the trainer checkpoints the frozen constants.
+        self.length_weight = LengthWeight.from_args(getattr(self.args.algo, "length_weight", None))
 
     def build_experiences(self, rollout_samples: List[Experience]) -> List[Experience]:
         """Turn balanced rollout samples into train-ready experiences: recompute the log-probs and
@@ -342,6 +346,24 @@ class RemoteExperienceMaker:
                 weights = self.turn_baseline.linear.weight.flatten().tolist()
                 self.advantage_metrics.update({f"baseline/w_{n}": w for n, w in zip(FEATURE_NAMES, weights)})
                 self.advantage_metrics["baseline/bias"] = self.turn_baseline.linear.bias.item()
+
+        if self.length_weight is not None:
+            # The actor applies the same weights from each row's action_mask.sum(-1).
+            masks = [exp.action_mask for exp in experiences]
+            self.advantage_metrics.update(
+                length_metrics(
+                    lengths=torch.cat([m.sum(-1) for m in masks]),
+                    rewards=rewards[rollouts["sample_to_rollout"]],
+                    truncated=torch.cat(
+                        [
+                            exp.truncated if exp.truncated is not None else torch.zeros(len(m), dtype=torch.bool)
+                            for exp, m in zip(experiences, masks)
+                        ]
+                    ),
+                    abs_advantages=torch.cat([masked_mean(a.abs(), m, dim=-1) for a, m in zip(advantages, masks)]),
+                    weight=self.length_weight,
+                )
+            )
 
         # Per-group reward std (on clipped rewards), broadcast to samples, for logging only.
         rollout_stds = torch.zeros_like(rewards)

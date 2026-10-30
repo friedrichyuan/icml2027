@@ -15,6 +15,7 @@
 
 import asyncio
 import copy
+import json
 import os
 import statistics
 import time
@@ -331,6 +332,21 @@ class BaseRLTrainer:
         turn_baseline.load_state_dict(state)
         logger.info(f"Restored turn_linear baseline ({turn_baseline.count} turns seen).")
 
+    def verify_length_weight(self, checkpoint_states) -> None:
+        """A resumed run must keep the length-weight constants it was frozen with."""
+        current = getattr(self.experience_maker, "length_weight", None)
+        saved = (checkpoint_states or {}).get("length_weight")
+        current_state = current.state_dict() if current is not None else None
+        if saved is None:
+            if current is not None and (checkpoint_states or {}).get("global_step", 0) > 0:
+                logger.warning("Checkpoint has no length_weight state; it was saved without --algo.length_weight.")
+            return
+        if saved != current_state:
+            raise ValueError(
+                f"--algo.length_weight {current_state} differs from the checkpoint's frozen {saved}; "
+                "resume with the same alpha, clip bounds and reference."
+            )
+
     def fit(self, global_step: int = 0) -> None:
         raise NotImplementedError("fit method is not implemented")
 
@@ -392,6 +408,16 @@ class BaseRLTrainer:
             "rollout/truncated_rate": truncated.float().mean().item(),
             "rollout/num_samples": float(num_turn_rows),
         }
+        lengths_file = getattr(getattr(self.args, "logger", None), "rollout_lengths_file", None)
+        if lengths_file:
+            record = {"step": global_step + 1, "lengths": [], "rewards": [], "truncated": []}
+            for s in rollout_samples:
+                if s.response_length is not None and s.truncated is not None and "reward" in s.info:
+                    record["lengths"] += s.response_length.flatten().tolist()
+                    record["rewards"] += s.info["reward"].flatten().tolist()
+                    record["truncated"] += s.truncated.flatten().int().tolist()
+            with open(lengths_file, "a") as f:
+                f.write(json.dumps(record) + "\n")
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors
         # from the producing runner via reload() — the images reach the rank straight from the
@@ -935,6 +961,8 @@ class TrainingActor(BaseRLTrainer):
             client_states.update({"global_step": global_step})
             if self.experience_maker.turn_baseline is not None:
                 client_states["turn_baseline"] = self.experience_maker.turn_baseline.state_dict()
+            if getattr(self.experience_maker, "length_weight", None) is not None:
+                client_states["length_weight"] = self.experience_maker.length_weight.state_dict()
             self._latest_client_states = client_states
             self.save_logs_and_checkpoints(global_step, status, client_states)
 
@@ -1029,6 +1057,7 @@ class RLTrainer:
         checkpoint_states = ray.get(self.trainer_actor.load_checkpoint_states_or_default.remote())
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
         ray.get(self.trainer_actor.restore_turn_baseline.remote(checkpoint_states))
+        ray.get(self.trainer_actor.verify_length_weight.remote(checkpoint_states))
 
         # .get with defaults: an interrupted save can leave model/ without extra_state.pt, so
         # load_ckpt returns states={} (weights load, scalars empty) — resume at 0, not KeyError.
