@@ -5,7 +5,8 @@
 #   ROOT=/mnt/data/yuanmingqi/code/icml2027 bash scripts/run_qwen_math_dlc.sh
 #   OUT=outputs/qwen-math-1.5b-lw_a0.75 bash scripts/run_qwen_math_dlc.sh --algo.length_weight.enabled ...
 #
-# Defaults: 8 visible GPUs (0-7), 4 vLLM + 4 actor, model/data under $ROOT/data.
+# Defaults: 8 visible GPUs (0-7), 4 vLLM + 4 actor; model under $ROOT or $ROOT/data,
+# datasets under $ROOT/data/qwen-math or $ROOT/qwen-math.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,23 +26,53 @@ export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
 export ACTOR_GPUS="${ACTOR_GPUS:-4}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
-# Prefer the ctx8192 wrapper; fall back to a plain Qwen2.5-Math-1.5B tree under data/.
+# Weights and datasets may sit directly under $ROOT (HPC) or under $ROOT/data (DLC).
+# Prefer the ctx8192 wrapper; fall back to a plain Qwen2.5-Math-1.5B tree.
 if [ -z "${MODEL:-}" ]; then
-  for candidate in \
-    "$ROOT/data/models/Qwen2.5-Math-1.5B-ctx8192" \
-    "$ROOT/data/models/Qwen2.5-Math-1.5B" \
-    "$ROOT/data/Qwen2.5-Math-1.5B-ctx8192" \
-    "$ROOT/data/Qwen2.5-Math-1.5B"
-  do
-    if [ -e "$candidate/config.json" ] || [ -e "$candidate/model.safetensors" ] || [ -e "$candidate/model.safetensors.index.json" ]; then
-      MODEL="$candidate"
+  for base in "$ROOT/data/models" "$ROOT/data" "$ROOT/models" "$ROOT"; do
+    for name in Qwen2.5-Math-1.5B-ctx8192 Qwen2.5-Math-1.5B; do
+      candidate="$base/$name"
+      if [ -e "$candidate/config.json" ] || [ -e "$candidate/model.safetensors" ] || [ -e "$candidate/model.safetensors.index.json" ]; then
+        MODEL="$candidate"
+        break 2
+      fi
+    done
+  done
+fi
+: "${MODEL:?set MODEL to the Qwen2.5-Math-1.5B directory (looked under $ROOT and $ROOT/data)}"
+# Stock Qwen2.5-Math-1.5B caps context at 4096 but the recipe needs prompt + 4096 new tokens:
+# wrap it like the local ctx8192 tree (weights symlinked, only the two window fields raised).
+if [ -e "$MODEL/config.json" ] && python - "$MODEL/config.json" << 'PY'
+import json, sys
+sys.exit(0 if json.load(open(sys.argv[1])).get("max_position_embeddings", 0) < 8192 else 1)
+PY
+then
+  wrapped="$ROOT/outputs/models/$(basename "$MODEL")-ctx8192"
+  mkdir -p "$wrapped"
+  for f in "$MODEL"/*; do
+    [ "$(basename "$f")" = config.json ] || ln -sfn "$(readlink -f "$f")" "$wrapped/$(basename "$f")"
+  done
+  python - "$MODEL/config.json" "$wrapped/config.json" << 'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+cfg["max_position_embeddings"] = 8192
+cfg["sliding_window"] = 8192
+json.dump(cfg, open(sys.argv[2], "w"), indent=2)
+PY
+  echo "wrapped $MODEL -> $wrapped (context 8192)"
+  MODEL="$wrapped"
+fi
+if [ -z "${TRAIN:-}" ] || [ -z "${EVAL:-}" ]; then
+  for base in "$ROOT/data/qwen-math" "$ROOT/qwen-math"; do
+    if [ -e "$base/train" ] && [ -e "$base/eval" ]; then
+      TRAIN="${TRAIN:-$base/train}"
+      EVAL="${EVAL:-$base/eval}"
       break
     fi
   done
 fi
-: "${MODEL:?set MODEL to the Qwen2.5-Math-1.5B directory under $ROOT/data}"
-TRAIN="${TRAIN:-$ROOT/data/qwen-math/train}"
-EVAL="${EVAL:-$ROOT/data/qwen-math/eval}"
+: "${TRAIN:?set TRAIN to the qwen-math train dataset (looked under $ROOT and $ROOT/data)}"
+: "${EVAL:?set EVAL to the qwen-math eval dataset (looked under $ROOT and $ROOT/data)}"
 OUT="${OUT:-$ROOT/outputs/qwen-math-1.5b}"
 mkdir -p "$OUT"
 
