@@ -19,6 +19,9 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export MAX_AGENT_TURNS=1
 export WANDB_MODE=disabled
+# Single-turn, <=4096 new tokens: no request legitimately takes 30 min, so a longer one was lost
+# (eval stalled with idle engines) and is resent instead of hanging the job.
+export MOLT_ROUTER_REQUEST_TIMEOUT="${MOLT_ROUTER_REQUEST_TIMEOUT:-1800}"
 
 # DLC nodes expose their GPUs as 0..N-1.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"

@@ -220,6 +220,17 @@ def test_post_retries_interrupted_response_body(monkeypatch, path, failed_attemp
     )
 
 
+def test_post_resends_timed_out_request(monkeypatch):
+    # A request lost inside the router/engine trips MOLT_ROUTER_REQUEST_TIMEOUT and is resent.
+    async def _no_sleep(*_a, **_k):
+        pass
+
+    monkeypatch.setattr("molt.trainer.rollout.router.asyncio.sleep", _no_sleep)
+    http = _FlakyHttp(_gen_resp([90]), asyncio.TimeoutError(), fail_times=1)
+    ro, _ = asyncio.run(RouterGenerateClient(http).generate([1, 2], _sp()))
+    assert http.attempts == 2 and ro.outputs[0].token_ids == [90]
+
+
 def test_post_fails_fast_on_4xx(monkeypatch):
     # A 4xx is a real client bug, not a transient — fail immediately without burning the retry budget.
     async def _no_sleep(*_a, **_k):

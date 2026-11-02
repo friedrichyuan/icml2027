@@ -31,6 +31,7 @@ trainer round-robins prompts across a list of them (``--rollout.num_runners``).
 import asyncio
 import base64
 import io
+import os
 import socket
 import time
 from copy import deepcopy
@@ -256,7 +257,8 @@ class RouterGenerateClient:
         the router or an engine is still warming up (its port binds before its workers pass health
         checks) or is briefly overloaded — so a hiccup costs a retry, not a dropped rollout (vime/slime
         retry the same way). A 4xx is a real client bug, so it fails fast rather than burn the retry
-        budget. The session sets no read timeout, so a slow generation never lands here at all."""
+        budget. By default the session sets no timeout, so a slow generation never lands here at all;
+        with MOLT_ROUTER_REQUEST_TIMEOUT a request that outlives it is resent like a dropped one."""
         headers = {"x-session-id": session_id} if session_id else None
         body = {"model": self.model_name, **payload}
         for attempt in range(retries):
@@ -264,10 +266,17 @@ class RouterGenerateClient:
                 async with self.http.post(path, json=body, headers=headers) as resp:
                     resp.raise_for_status()
                     return await resp.json()
-            except (aiohttp.ClientResponseError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
+            except (
+                aiohttp.ClientResponseError,
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+            ) as e:
                 fatal = isinstance(e, aiohttp.ClientResponseError) and e.status < 500  # 4xx = real bug
                 if fatal or attempt == retries - 1:
                     raise
+                if isinstance(e, asyncio.TimeoutError):
+                    print(f"[router] {path} exceeded MOLT_ROUTER_REQUEST_TIMEOUT; resending", flush=True)
             await asyncio.sleep(attempt + 1)
 
     async def _render(self, images, session_id):
@@ -368,10 +377,14 @@ class AgentRunnerActor:
         # gets resent and re-runs from token 0, hitting the same wall — the retry can never
         # succeed. slime takes the same position (httpx.Timeout(None) on its rollout client).
         # A crashed engine still surfaces immediately as a connection error, which _post retries.
+        # But a request lost inside the router/engine (engine idle, client still waiting) stalls the
+        # step forever; recipes with a bounded worst-case turn (single turn, capped max_new_tokens)
+        # can set MOLT_ROUTER_REQUEST_TIMEOUT (seconds) well above it so such a request is resent.
         # limit=0: don't cap concurrency to the engine fleet at aiohttp's default of 100.
+        request_timeout = float(os.environ.get("MOLT_ROUTER_REQUEST_TIMEOUT", "0")) or None
         self._http = aiohttp.ClientSession(
             base_url=router_url,
-            timeout=aiohttp.ClientTimeout(total=None),
+            timeout=aiohttp.ClientTimeout(total=request_timeout),
             connector=aiohttp.TCPConnector(limit=0),
         )
         self._client = RouterGenerateClient(self._http, model_name=model_name, image_token_id=image_token_id)
