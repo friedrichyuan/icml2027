@@ -11,7 +11,8 @@
 # Arms: A original Flash | B K=2 | C K=2+shrink | D K=2+optim_only | E K=1+shrink
 #       B4 K=4 | D4 K=4+optim_only
 # GPU / model overrides (CUDA_VISIBLE_DEVICES, VLLM_NUM_ENGINES, ACTOR_GPUS, MODEL) pass through
-# to run_qwen_math_dlc.sh.
+# to run_qwen_math_dlc.sh. Assumes the job owns its node: before every launch it kills leftover
+# Ray / vLLM processes and waits up to GPU_WAIT_MIN minutes for the GPUs to empty.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARM="${ARM:?set ARM to one of A B C D E B4 D4}"
@@ -19,6 +20,7 @@ SEED="${SEED:-42}"
 STOP_STEP="${STOP_STEP:-400}"
 HANG_MIN="${HANG_MIN:-90}"
 MAX_RESTARTS="${MAX_RESTARTS:-3}"
+GPU_WAIT_MIN="${GPU_WAIT_MIN:-10}"
 
 case "$ARM" in
   A) flags="" ;;
@@ -43,11 +45,30 @@ stop_run() {
   ray stop --force >/dev/null 2>&1
 }
 
+# vLLM EngineCore processes are spawned by Ray workers and can outlive `ray stop`, keeping
+# ~0.85 of each rollout GPU; a retry then fails at vLLM startup. Kill leftovers and wait until
+# every visible GPU is (nearly) empty before launching.
+free_gpus() {
+  ray stop --force >/dev/null 2>&1
+  pkill -9 -f 'molt.cli.train_rl_ray|EngineCore|RolloutRayActor|ray::' 2>/dev/null
+  command -v nvidia-smi >/dev/null || return 0
+  local gpus="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}" used=unknown
+  for ((i = 0; i < GPU_WAIT_MIN * 6; i++)); do
+    used="$(nvidia-smi -i "$gpus" --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | tail -1)"
+    [ "${used:-0}" -lt 2048 ] && return 0
+    sleep 10
+  done
+  echo "$(date '+%F %T') GPUs $gpus still busy after ${GPU_WAIT_MIN}m (max used ${used} MiB):" | tee -a "$log"
+  nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv | tee -a "$log"
+  return 1
+}
+
 for ((attempt = 0; attempt <= MAX_RESTARTS; attempt++)); do
   if reached; then
     echo "$(date '+%F %T') $ARM seed $SEED already has its eval at step $STOP_STEP"
     exit 0
   fi
+  free_gpus || exit 1
   echo "$(date '+%F %T') arm=$ARM seed=$SEED attempt=$attempt flags: $flags $*" | tee -a "$log"
   # Own process group so the whole Ray driver tree can be stopped at STOP_STEP.
   # shellcheck disable=SC2086
