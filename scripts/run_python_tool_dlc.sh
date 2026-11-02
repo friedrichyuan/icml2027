@@ -29,7 +29,8 @@ done
 export OUT="${OUT:-$ROOT/outputs/qwen7b-tool}"
 export MAX_AGENT_TURNS="${MAX_AGENT_TURNS:-10}"
 
-# 7B checkpoints are ~15 GB (HF) and ~90 GB (DCP state with Adam), so keep fewer HF copies.
+# 7B checkpoints are ~15 GB (HF) and ~90 GB (DCP state with Adam): keep only the latest of each
+# and skip the extra full checkpoint on every new best eval.
 exec bash "$ROOT/scripts/run_qwen_math_dlc.sh" \
   --data.tools_key tools \
   --data.max_len 8192 \
@@ -40,6 +41,8 @@ exec bash "$ROOT/scripts/run_qwen_math_dlc.sh" \
   --train.agent_path "$ROOT/labs-molt/examples/python/agents/python_tool_qwen25.py" \
   --eval.n_samples_per_prompt 4 \
   --eval.eval_at_start \
-  --ckpt.save_steps 25 \
-  --ckpt.max_num 6 \
+  --ckpt.save_steps 50 \
+  --ckpt.max_num 1 \
+  --ckpt.dcp_max_num 1 \
+  --ckpt.best_metric_key none \
   "$@"
