@@ -60,10 +60,13 @@ log="$OUT/train.log"
 
 reached() { [ "$STOP_STEP" -gt 0 ] && grep -q "Eval at step $STOP_STEP:" "$log" 2>/dev/null; }
 
+# Bash already puts a background job in its own process group (pgid == pid), so
+# kill -- -pid tears down the launcher and its children. Ray / vLLM workers that
+# escape the group are cleaned by free_gpus on the next attempt.
 stop_run() {
-  kill -- "-$1" 2>/dev/null
+  kill -- "-$1" 2>/dev/null || kill "$1" 2>/dev/null
   sleep 30
-  kill -9 -- "-$1" 2>/dev/null
+  kill -9 -- "-$1" 2>/dev/null || kill -9 "$1" 2>/dev/null
   ray stop --force >/dev/null 2>&1
 }
 
@@ -92,9 +95,12 @@ for ((attempt = 0; attempt <= MAX_RESTARTS; attempt++)); do
   fi
   free_gpus || exit 1
   echo "$(date '+%F %T') arm=$ARM seed=$SEED attempt=$attempt flags: ${flags[*]} $*" | tee -a "$log"
-  # Own process group so the whole Ray driver tree can be stopped at STOP_STEP.
-  # 9>&-: leftover vLLM processes must not inherit the node lock and block the next run.
-  setsid bash "$launcher" "${flags[@]}" --train.seed "$SEED" --ckpt.load_enable "$@" 9>&- &
+  # Do NOT wrap with bare `setsid`: when this script's background job is already a
+  # process-group leader (typical under DLC), setsid forks and the parent exits at
+  # once, so $! dies within a second. The watchdog then treats training as finished
+  # or crashed and relaunches — that was creating a fresh tb/rl_* every few minutes.
+  # 9>&-: leftover vLLM must not inherit the node lock and block the next run.
+  bash "$launcher" "${flags[@]}" --train.seed "$SEED" --ckpt.load_enable "$@" 9>&- &
   pid=$!
   while sleep 60; do
     if reached; then
@@ -105,7 +111,9 @@ for ((attempt = 0; attempt <= MAX_RESTARTS; attempt++)); do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"
       rc=$?
-      if [ "$rc" -eq 0 ]; then
+      # A true full-recipe finish is exit 0 with STOP_STEP=0. Exit 0 before STOP_STEP
+      # is the old setsid false-finish; treat it as a crash and resume.
+      if [ "$rc" -eq 0 ] && { [ "$STOP_STEP" -eq 0 ] || reached; }; then
         echo "$(date '+%F %T') $ARM seed $SEED finished" | tee -a "$log"
         exit 0
       fi
