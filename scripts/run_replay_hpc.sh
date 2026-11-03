@@ -44,6 +44,16 @@ case "$ARM" in
   D4) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
   *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac
+# free_gpus kills every Ray / vLLM process on the node, so a second launcher here would kill the
+# first one's training. Refuse to start while another holds the node lock.
+lock=/tmp/molt_replay_hpc.lock
+exec 9> "$lock"
+if ! flock -n 9; then
+  echo "another run_replay_hpc.sh is running on this node ($(cat "$lock.owner" 2>/dev/null)); not starting $ARM seed $SEED" >&2
+  exit 1
+fi
+echo "$ARM seed $SEED pid $$ since $(date '+%F %T')" > "$lock.owner"
+
 export OUT="${OUT:-$ROOT/outputs/${run_prefix}-replay_${ARM}_s${SEED}}"
 mkdir -p "$OUT"
 log="$OUT/train.log"
@@ -83,7 +93,8 @@ for ((attempt = 0; attempt <= MAX_RESTARTS; attempt++)); do
   free_gpus || exit 1
   echo "$(date '+%F %T') arm=$ARM seed=$SEED attempt=$attempt flags: ${flags[*]} $*" | tee -a "$log"
   # Own process group so the whole Ray driver tree can be stopped at STOP_STEP.
-  setsid bash "$launcher" "${flags[@]}" --train.seed "$SEED" --ckpt.load_enable "$@" &
+  # 9>&-: leftover vLLM processes must not inherit the node lock and block the next run.
+  setsid bash "$launcher" "${flags[@]}" --train.seed "$SEED" --ckpt.load_enable "$@" 9>&- &
   pid=$!
   while sleep 60; do
     if reached; then
