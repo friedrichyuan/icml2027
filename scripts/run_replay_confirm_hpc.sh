@@ -9,19 +9,13 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Multi-seed A/B/D (A to 800 for the wall-clock-matched comparison), the K=1 + optim_only
-# control F, and the reset-scope ablations.
-default=(
-  A:42:800 A:1:800 A:2:800
-  B:42 B:1 B:2
-  D:42 D:1 D:2
-  F:42 F:1 F:2
-  D_all:42 D_down:42
-)
+# Seed-42 ablations: A (to 800 for the wall-clock-matched comparison), B, D, the K=1 +
+# optim_only control F, and the reset-scope variants.
+default=(A:42:800 B:42 D:42 F:42 D_all:42 D_down:42)
 items=("$@")
 [ ${#items[@]} -gt 0 ] || items=("${default[@]}")
 
-# 14 arms: keep only the latest HF snapshot and resumable state per arm, no best-eval copies.
+# Keep only the latest HF snapshot and resumable state per arm, no best-eval copies.
 ckpt=(--ckpt.max_num 1 --ckpt.dcp_max_num 1 --ckpt.best_metric_key none)
 
 failed=()
