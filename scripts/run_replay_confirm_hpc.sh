@@ -9,9 +9,9 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Seed-42 ablations: A (to 800 for the wall-clock-matched comparison), B, D, the K=1 +
-# optim_only control F, and the reset-scope variants.
-default=(A:42:800 B:42 D:42 F:42 D_all:42 D_down:42)
+# Seed-42 ablations not yet run locally (A-E are): the K=1 + optim_only control F and the
+# reset-scope variants.
+default=(F:42 D_all:42 D_down:42)
 items=("$@")
 [ ${#items[@]} -gt 0 ] || items=("${default[@]}")
 
