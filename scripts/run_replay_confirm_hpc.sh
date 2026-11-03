@@ -10,8 +10,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Seed-42 ablations not yet run locally (A-E are): the K=1 + optim_only control F and the
-# reset-scope variants, then D through the full 34-episode recipe (STOP_STEP 0; resumes the
-# 400-step D_s42 run).
+# reset-scope variants, then D through the full 34-episode recipe (STOP_STEP 0).
 default=(F:42 D_all:42 D_down:42 D:42:0)
 items=("$@")
 [ ${#items[@]} -gt 0 ] || items=("${default[@]}")
