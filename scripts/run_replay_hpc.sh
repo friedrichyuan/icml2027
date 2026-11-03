@@ -61,13 +61,16 @@ log="$OUT/train.log"
 reached() { [ "$STOP_STEP" -gt 0 ] && grep -q "Eval at step $STOP_STEP:" "$log" 2>/dev/null; }
 
 # Bash already puts a background job in its own process group (pgid == pid), so
-# kill -- -pid tears down the launcher and its children. Ray / vLLM workers that
-# escape the group are cleaned by free_gpus on the next attempt.
+# kill -- -pid tears down the launcher and its children. Ray / vLLM EngineCore
+# workers often escape that group — always pkill them here too, otherwise a
+# successful "reached STOP_STEP" exit leaves GPUs busy on DLC.
 stop_run() {
   kill -- "-$1" 2>/dev/null || kill "$1" 2>/dev/null
   sleep 30
   kill -9 -- "-$1" 2>/dev/null || kill -9 "$1" 2>/dev/null
   ray stop --force >/dev/null 2>&1
+  pkill -9 -f 'molt.cli.train_rl_ray|EngineCore|RolloutRayActor|ray::' 2>/dev/null
+  sleep 5
 }
 
 # vLLM EngineCore processes are spawned by Ray workers and can outlive `ray stop`, keeping
