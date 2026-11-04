@@ -524,6 +524,22 @@ class PolicyTrainer:
             experience.info["vllm_kl"] = vllm_kl.detach()
         if is_filter_ratio is not None:
             experience.info["is_filter_ratio"] = is_filter_ratio.detach()
+        buckets = getattr(getattr(self.args, "task_sampler", None), "buckets", None)
+        if buckets:
+            # First-time gate acceptance per task bucket (a replayed row lost its bucket on first use).
+            # Every rank must report the same keys, so absent buckets report zeros.
+            bucket = experience.info.pop("task_bucket", None)
+            if is_filter_ratio is not None:
+                accept = 1.0 - is_filter_ratio.detach().float().flatten()
+                if isinstance(bucket, list):  # make_experience_batch keeps per-sample 0-d tensors as a list
+                    bucket = torch.tensor([-1 if b is None else int(b) for b in bucket])
+                if not torch.is_tensor(bucket) or bucket.numel() != accept.numel():
+                    bucket = torch.full_like(accept, -1)
+                bucket = bucket.to(accept.device)
+                for j, name in enumerate(buckets):
+                    seen = (bucket == j).float()
+                    experience.info[f"gate_seen/{name}"] = seen
+                    experience.info[f"gate_accept/{name}"] = seen * accept
         if rollout_log_probs is not None:
             experience.info.update(mismatch_metrics(rollout_log_probs, action_log_probs, action_mask))
         if rollout_top_log_probs is not None:

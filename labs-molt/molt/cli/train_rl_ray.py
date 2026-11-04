@@ -69,6 +69,20 @@ def train(args):
 
     # configure strategy
     strategy = get_strategy(args)
+    if args.task_sampler.mode != "off":
+        from molt.datasets.utils import blending_datasets
+
+        # The bucket vocabulary rides on args so the actor workers can log per-bucket gate
+        # acceptance under one fixed key set (every rank must reduce the same metric keys).
+        train_data = blending_datasets(
+            args.data.prompt_dataset, None, strategy, args.train.seed, dataset_split=args.data.prompt_split
+        )
+        if args.task_sampler.bucket_key not in train_data.column_names:
+            raise ValueError(
+                f"--task_sampler needs a '{args.task_sampler.bucket_key}' column (scripts/assign_task_buckets.py)."
+            )
+        rows = train_data.select(range(min(args.data.max_samples, len(train_data))))[args.task_sampler.bucket_key]
+        args.task_sampler.buckets = sorted(set(rows))
     printed_args = copy.deepcopy(args)
     printed_args.logger.wandb.key = None  # driver logs are often shared; never echo the W&B key
     strategy.print(printed_args)
@@ -972,6 +986,43 @@ if __name__ == "__main__":
         help="fnmatch pattern over actor parameter names selecting S (activation checkpointing inserts "
         "'_checkpoint_wrapped_module.' into the names, so avoid anchoring on the parent module).",
     )
+    # Budget-aware task sampling (molt/trainer/algorithm/task_sampler.py).
+    parser.add_argument(
+        "--task_sampler.mode",
+        choices=["off", "original", "signal_only", "cost_only", "combined"],
+        default="off",
+        help="off: the plain shuffled dataloader. original: bucket sampler at p0 (the logged control).",
+    )
+    parser.add_argument("--task_sampler.bucket_key", type=str, default="task_bucket", help="Dataset bucket column.")
+    parser.add_argument("--task_sampler.exploration_mix", type=float, default=0.3, help="eta: p = eta p0 + (1-eta) q.")
+    parser.add_argument("--task_sampler.cost_exponent", type=float, default=0.5, help="gamma in G = (C_ref/C)^gamma.")
+    parser.add_argument("--task_sampler.signal_epsilon", type=float, default=0.05, help="eps_L in S.")
+    parser.add_argument("--task_sampler.raw_weight_min", type=float, default=0.5)
+    parser.add_argument("--task_sampler.raw_weight_max", type=float, default=2.0)
+    parser.add_argument(
+        "--task_sampler.min_samples_per_window", type=int, default=64, help="Trajectories per bucket window."
+    )
+    parser.add_argument(
+        "--task_sampler.refresh_every_new_batches", type=int, default=8, help="Scheduler cycle length."
+    )
+    parser.add_argument(
+        "--task_sampler.cohort_completion_threshold",
+        type=float,
+        default=0.95,
+        help="A cycle enters the windows once this fraction of its trajectories reported back.",
+    )
+    parser.add_argument("--task_sampler.cost_metric", choices=["policy_tokens"], default="policy_tokens")
+    parser.add_argument("--task_sampler.cost_floor", type=float, default=32.0, help="Positive floor on C_b, C_ref.")
+    parser.add_argument("--task_sampler.success_threshold", type=float, default=0.5, help="reward >= this = success.")
+    parser.add_argument(
+        "--task_sampler.eval_every_tokens", type=int, default=0, help="Also eval every N policy tokens (0 = off)."
+    )
+    parser.add_argument(
+        "--task_sampler.max_policy_tokens",
+        type=int,
+        default=0,
+        help="Stop after one last eval once this many policy tokens were generated (0 = off).",
+    )
     parser.add_argument(
         "--train.full_determinism_enable",
         action="store_true",
@@ -1409,6 +1460,17 @@ if __name__ == "__main__":
             raise ValueError("--train.reset.start and --train.reset.interval must be >= 1.")
         if args.actor.lora_dim > 0 or args.fsdp.offload != "none":
             raise ValueError("--train.reset supports full-parameter FSDP training with GPU-resident Adam state.")
+
+    ts = args.task_sampler
+    if ts.mode != "off":
+        if not 0 <= ts.exploration_mix <= 1 or not 0 < ts.raw_weight_min <= ts.raw_weight_max:
+            raise ValueError("--task_sampler needs 0 <= exploration_mix <= 1, 0 < raw_weight_min <= raw_weight_max.")
+        if ts.min_samples_per_window < 1 or ts.refresh_every_new_batches < 1 or ts.cost_floor <= 0:
+            raise ValueError(
+                "--task_sampler needs min_samples_per_window and refresh_every_new_batches >= 1, and cost_floor > 0."
+            )
+        if args.data.prompt_probs or args.algo.dynamic_filtering_enable:
+            raise ValueError("--task_sampler draws from one dataset without dynamic filtering.")
 
     assert (
         args.rollout.n_samples_per_prompt * args.rollout.batch_size // args.rollout.micro_batch_size

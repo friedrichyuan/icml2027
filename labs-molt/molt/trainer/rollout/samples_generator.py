@@ -100,6 +100,8 @@ def _sample_group_key(sample) -> int | str:
 class SamplesGenerator:
     """Stream prompts through a persistent pool of rollout workers."""
 
+    task_sampler = None  # TaskSampler under --task_sampler.mode != off
+
     def __init__(
         self,
         strategy,
@@ -120,6 +122,19 @@ class SamplesGenerator:
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
 
+        ts = getattr(self.args, "task_sampler", None)
+        if ts is not None and ts.mode != "off":
+            from molt.trainer.algorithm.task_sampler import TaskSampler
+
+            rows = prompts_dataloader.dataset.dataset[ts.bucket_key]
+            self.task_sampler = TaskSampler(
+                rows,
+                getattr(ts, "buckets", None) or sorted(set(rows)),
+                ts,
+                self.args.train.seed,
+                log_dir=os.path.join(os.path.dirname(self.args.ckpt.path.rstrip("/")), "task_sampler"),
+            )
+
     # Warm-resume (opt-in via --ckpt.warm_resume_rollouts). At every train step, save the rollout
     # groups that finished but were NOT trained yet — the surplus kept beyond the batch just shipped
     # (self._finished_samples) — so a resumed run trains them right away instead of idling ~one
@@ -130,10 +145,12 @@ class SamplesGenerator:
     _BUFFER = "rollout_buffer.pt"
 
     def state_dict(self) -> Dict:
-        """Save this step's untrained rollout groups to a fresh sidecar file, return its path."""
+        """Save this step's untrained rollout groups to a fresh sidecar file, return its path
+        (plus the task sampler's state when it is on)."""
+        state = {"task_sampler": self.task_sampler.state_dict()} if self.task_sampler else {}
         finished = getattr(self, "_finished_samples", None)
         if not getattr(self.args.ckpt, "warm_resume_rollouts", False) or not finished:
-            return {}
+            return state
         try:
             # The rollout is held as lazy Experiences whose heavy tensors (token ids / images /
             # routing) live in the runners' object stores (Experience.heavy_ref); those refs die
@@ -150,13 +167,15 @@ class SamplesGenerator:
             torch.save(local, path)
             for stale in sorted(os.scandir(d), key=lambda e: e.stat().st_mtime)[:-3]:  # keep newest 3; bound disk
                 os.remove(stale.path)
-            return {"buffer_file": path}
+            return {**state, "buffer_file": path}
         except Exception as e:  # bookkeeping must never break the checkpoint
             logger.warning(f"warm-resume: save skipped ({e})")
-            return {}
+            return state
 
     def load_state_dict(self, state_dict: Optional[Dict]) -> None:
         """Restore this checkpoint's untrained groups (if any) to seed the first post-resume batch."""
+        if self.task_sampler:
+            self.task_sampler.load_state_dict((state_dict or {}).get("task_sampler"))
         path = (state_dict or {}).get("buffer_file")
         if not path or not os.path.exists(path):
             return  # no file / failed save -> normal resume
@@ -224,7 +243,12 @@ class SamplesGenerator:
         # round returned exhausted=True. Keying on live pool state instead would mistake a
         # mid-stream exhausted iterator for a fresh round and drop the in-flight tail.
         if getattr(self, "_round_exhausted", True):
-            self._dataloader_iter = iter(self.prompts_dataloader)
+            # The task sampler draws each prompt when its slot is filled (see _collect_prompt_batch).
+            self._dataloader_iter = (
+                self.task_sampler.episode(self.prompts_dataloader.dataset)
+                if self.task_sampler
+                else iter(self.prompts_dataloader)
+            )
             # Seed from a warm-resume buffer if load_state_dict restored one, so the first
             # post-resume batch ships without waiting for a full fresh generation. Consumed once.
             self._finished_samples: List[Experience] = list(getattr(self, "_resumed_samples", None) or [])
@@ -259,9 +283,13 @@ class SamplesGenerator:
                 )
                 prompts_dispatched += len(prompts)
                 if prompts:
-                    self._inflight_rollouts.extend(
-                        self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
+                    refs = self._dispatch_to_agent_runners(
+                        prompts, labels, images=images, tools=tools, **generate_kwargs
                     )
+                    self._inflight_rollouts.extend(refs)
+                    if self.task_sampler:
+                        n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+                        self.task_sampler.bind(refs, n_samples)
                 if dataloader_exhausted:
                     self._dataloader_iter = None
                     logger.info("Prompt dataloader is exhausted.")
@@ -311,6 +339,9 @@ class SamplesGenerator:
             else:
                 leftover_samples.append(sample)
         self._finished_samples = leftover_samples
+        if self.task_sampler and batch_samples:
+            self.task_sampler.on_new_batch()
+            rollout_metrics.update(self.task_sampler.metrics())
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts
@@ -370,7 +401,11 @@ class SamplesGenerator:
         # kept on the runner behind heavy_ref) or reported a drop reason — the controller only
         # tallies drops and applies the group-level DAPO filter here (both meta-only).
         group_samples: List[Experience] = []
-        for experience, drop_reason in ray.get(finished_rollout):
+        results = ray.get(finished_rollout)
+        if self.task_sampler:
+            # Before any filtering: the sampler's statistics must see every finished trajectory.
+            self.task_sampler.complete(finished_rollout, results)
+        for experience, drop_reason in results:
             if experience is not None:
                 group_samples.append(experience)
             elif drop_reason is not None:
@@ -604,6 +639,8 @@ class SamplesGenerator:
             # What this segment cost against data.max_len: tool feedback included, and the image
             # tokens vLLM expands the placeholders into rather than the placeholders themselves.
             "context_length": torch.tensor([total_length + response.image_budget]),
+            # Policy turns in this segment = environment interactions (the task sampler's budget).
+            "num_turns": torch.tensor([len(response.action_ranges)]),
         }
         if response.mm_train_inputs is not None and media_ids:
             # Embedded image tokens that actually enter training. An image silently dropped or rendered

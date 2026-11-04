@@ -14,6 +14,9 @@
 # Arms: A original Flash | B K=2 | C K=2+shrink | D K=2+optim_only | E K=1+shrink
 #       F K=1+optim_only | D_all / D_down D with the Adam reset on all params / MLP down_proj
 #       B4 K=4 | D4 K=4+optim_only
+#       TS_original / TS_signal_only / TS_cost_only / TS_combined: budget-aware task sampling on
+#       original Flash; needs TRAIN/EVAL with a task_bucket column (scripts/hpc/sampler_*.sh), and
+#       ends itself after the eval at TS_MAX_TOKENS policy tokens (evals every TS_EVAL_TOKENS)
 # GPU / model overrides (CUDA_VISIBLE_DEVICES, VLLM_NUM_ENGINES, ACTOR_GPUS, MODEL) pass through
 # to the task launcher. Assumes the job owns its node: before every launch it kills leftover
 # Ray / vLLM processes and waits up to GPU_WAIT_MIN minutes for the GPUs to empty.
@@ -24,7 +27,7 @@ case "${TASK:-math}" in
   tool) launcher="$ROOT/scripts/run_python_tool_dlc.sh" run_prefix=qwen7b-tool ;;
   *) echo "unknown TASK=$TASK (math or tool)" >&2; exit 1 ;;
 esac
-ARM="${ARM:?set ARM to one of A B C D E F D_all D_down B4 D4}"
+ARM="${ARM:?set ARM to one of A B C D E F D_all D_down B4 D4 TS_original TS_signal_only TS_cost_only TS_combined}"
 SEED="${SEED:-42}"
 STOP_STEP="${STOP_STEP:-400}"
 HANG_MIN="${HANG_MIN:-90}"
@@ -42,8 +45,13 @@ case "$ARM" in
   D_down) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*.down_proj.weight') ;;
   B4) flags=(--train.replay.update_ratio 4) ;;
   D4) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
+  TS_original | TS_signal_only | TS_cost_only | TS_combined)
+    flags=(--task_sampler.mode "${ARM#TS_}" --eval.steps 1000000
+      --task_sampler.eval_every_tokens "${TS_EVAL_TOKENS:-15000000}"
+      --task_sampler.max_policy_tokens "${TS_MAX_TOKENS:-60000000}") ;;
   *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac
+case "$ARM" in TS_*) run_name="$ARM" ;; *) run_name="replay_$ARM" ;; esac
 # free_gpus kills every Ray / vLLM process on the node, so a second launcher here would kill the
 # first one's training. Refuse to start while another holds the node lock.
 lock=/tmp/molt_replay_hpc.lock
@@ -54,7 +62,14 @@ if ! flock -n 9; then
 fi
 echo "$ARM seed $SEED pid $$ since $(date '+%F %T')" > "$lock.owner"
 
-export OUT="${OUT:-$ROOT/outputs/${run_prefix}-replay_${ARM}_s${SEED}}"
+if [[ "$ARM" == TS_* && -z "${TRAIN:-}" ]]; then
+  [ "${TASK:-math}" = math ] || { echo "TS_* arms need TRAIN/EVAL with a task_bucket column" >&2; exit 1; }
+  src="$ROOT/data/qwen-math"; [ -e "$src/train" ] || src="$ROOT/qwen-math"
+  dst="$ROOT/data/qwen-math-bucketed"
+  [ -e "$dst/eval" ] || python "$ROOT/scripts/assign_task_buckets.py" --src "$src" --dst "$dst" || exit 1
+  export TRAIN="$dst/train" EVAL="$dst/eval"
+fi
+export OUT="${OUT:-$ROOT/outputs/${run_prefix}-${run_name}_s${SEED}}"
 mkdir -p "$OUT"
 log="$OUT/train.log"
 

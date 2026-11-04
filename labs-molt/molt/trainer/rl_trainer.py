@@ -153,8 +153,9 @@ def _collect_rollout_rewards(rollout_samples):
     )
 
 
-def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
-    """Compute pass@k eval metrics from generated samples.
+def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt, prompt_to_bucket=None):
+    """Compute pass@k eval metrics from generated samples (also per task bucket when
+    ``prompt_to_bucket`` maps each eval prompt to one).
 
     Robust to dropped rollouts: samples are grouped by their rollout ``group_id``
     (falling back to the prompt string when group ids are absent) rather than a
@@ -210,12 +211,17 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         grouped[key]["truncated"].append(_first_scalar(s.truncated))
 
     metrics = {}
+    buckets: Dict[str, Dict[str, list]] = {}
     for key in group_order:
         g = grouped[key]
         prompt = group_prompt[key]
         rewards = [r for r in g["rewards"] if r is not None]
         if not rewards:
             continue
+        if prompt_to_bucket:
+            b = buckets.setdefault(prompt_to_bucket.get(prompt, "unknown"), {"pass1": [], "lengths": []})
+            b["pass1"].append(sum(rewards) / len(rewards))
+            b["lengths"].extend(x for x in g["lengths"] if x is not None)
         ds = prompt_to_datasource.get(prompt, "unknown")
         if ds not in metrics:
             metrics[ds] = {
@@ -249,6 +255,10 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         logs["eval_response_length_mean"] = sum(total_lengths) / len(total_lengths)
     if total_truncated:
         logs["eval_truncated_rate"] = sum(total_truncated) / len(total_truncated)
+    for name, b in buckets.items():
+        logs[f"eval_bucket_{name}_pass1"] = sum(b["pass1"]) / len(b["pass1"])
+        if b["lengths"]:
+            logs[f"eval_bucket_{name}_response_length_mean"] = sum(b["lengths"]) / len(b["lengths"])
     logs["eval_num_samples"] = float(len(seen_episodes))
 
     return logs
@@ -565,6 +575,12 @@ class BaseRLTrainer:
         status: dict = {}
         for result in ray.get(refs):
             status.update(result)
+        # Both are sample means over the step, so their ratio is the bucket's acceptance rate.
+        for key in [k for k in status if k.startswith("gate_seen/")]:
+            name = key.split("/", 1)[1]
+            seen, accepted = status.pop(key), status.pop(f"gate_accept/{name}", 0.0)
+            if seen > 0:
+                status[f"task_sampler/gate_accept/{name}"] = accepted / seen
         # Fail loudly when the vLLM-IS filter dropped every sequence: the policy
         # gradient is exactly zero and the run silently optimizes nothing. The
         # usual cause is rollout-vs-train forward mismatch, for MoE models most
@@ -795,6 +811,7 @@ class GenerateSamplesActor:
         # normal eval_steps multiples a continuous run would hit (no per-resume eval).
         # Fresh runs are already in sync (step-0 baseline + _next_eval_step=eval_steps).
         eval_synced = fresh_start
+        sampler = self.samples_generator.task_sampler
         for ep in range(episode, self.args.train.num_episodes):
             # Reshuffle prompts each episode (seed+epoch); without this every
             # episode replays the identical order. The generator rebuilds its
@@ -838,7 +855,13 @@ class GenerateSamplesActor:
                         else (self._eval_at_start and self._last_eval_step < 0 and fresh_start)
                     )
                 )
+                # Budget-aligned eval points: every N generated policy tokens, and a last one at the cap.
+                # Not at the transient global_step 0 a resume starts from (see fresh_start above).
+                should_eval |= (
+                    self.eval_dataloader is not None and sampler is not None and global_step > 0 and sampler.eval_due()
+                )
                 if should_eval:
+                    eval_t0 = time.time()
                     self._last_eval_step = global_step
                     self._next_eval_step = (global_step // eval_steps + 1) * eval_steps
                     logger.info(f"Starting async evaluation at step {global_step}...")
@@ -855,8 +878,14 @@ class GenerateSamplesActor:
                     finally:
                         if not self._partial_rollout:
                             ray.get(self.vllm_lock.release.remote())
+                    if sampler is not None:
+                        eval_metrics.update(sampler.budget_metrics())
+                        sampler.mark_eval(global_step, eval_metrics, time.time() - eval_t0)
                     logger.info(f"Async evaluation completed: {eval_metrics}")
                     self.rollout_queue.put(("eval", global_step, eval_metrics), block=True)
+                    if sampler is not None and sampler.final_eval_done:
+                        logger.info(f"Policy-token budget spent at step {global_step}; stopping.")
+                        break
                     continue
 
                 if self.args.train.rollout_replay_dir:
@@ -877,6 +906,8 @@ class GenerateSamplesActor:
                         ray.get(self.vllm_lock.acquire.remote())
                     try:
                         t0 = time.time()
+                        if sampler is not None:
+                            sampler.policy_version = global_step
                         rollout_samples, rollout_metrics, prompts_consumed, is_exhausted = (
                             self.samples_generator.generate_samples(**self.generate_kwargs)
                         )
@@ -918,6 +949,8 @@ class GenerateSamplesActor:
                     break
 
             pbar.close()
+            if sampler is not None and sampler.final_eval_done:
+                break
 
         self.rollout_queue.put("done", block=True)
 
@@ -934,7 +967,15 @@ class GenerateSamplesActor:
             if override is not None:
                 eval_kwargs[key] = override
         samples_list = self.samples_generator.generate_eval_samples(**eval_kwargs)
-        return compute_eval_metrics(self.eval_dataloader, samples_list, eval_n)
+        prompt_to_bucket = None
+        if self.samples_generator.task_sampler is not None:
+            if getattr(self, "_prompt_to_bucket", None) is None:
+                # Eval prompt -> task bucket, when the eval set carries the bucket column too.
+                data, key = self.eval_dataloader.dataset, self.args.task_sampler.bucket_key
+                rows = data.dataset[key] if key in data.dataset.column_names else []
+                self._prompt_to_bucket = {str(data[i][1]): bucket for i, bucket in enumerate(rows)}
+            prompt_to_bucket = self._prompt_to_bucket
+        return compute_eval_metrics(self.eval_dataloader, samples_list, eval_n, prompt_to_bucket)
 
     def run_eval_only(self) -> dict:
         # eval-only entrypoint: one eval pass, no vllm_lock/queue (no training runs alongside).
