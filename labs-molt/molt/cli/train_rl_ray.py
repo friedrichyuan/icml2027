@@ -956,6 +956,13 @@ if __name__ == "__main__":
         "--train.replay.max_age", type=int, default=32, help="Learner updates since first use before eviction."
     )
     parser.add_argument(
+        "--train.replay.max_filter_ratio",
+        type=float,
+        default=-1.0,
+        help="hold: skip the replay Adam step when the sequence gate rejects more than this fraction of the "
+        "replay batch (-1 = off). The LR schedule still advances. Strategy hold uses 0.3.",
+    )
+    parser.add_argument(
         "--train.reset.mode",
         choices=["off", "shrink", "optim_only"],
         default="off",
@@ -1394,6 +1401,9 @@ if __name__ == "__main__":
 
     if args.train.replay.update_ratio < 1:
         raise ValueError("--train.replay.update_ratio must be >= 1.")
+    cap = args.train.replay.max_filter_ratio
+    if cap > 1 or (cap < 0 and cap != -1):
+        raise ValueError("--train.replay.max_filter_ratio must be in [0, 1], or -1 to disable the hold.")
     if args.train.replay.update_ratio > 1 and not (
         args.train.force_on_policy and args.algo.kl.init_coef == 0 and args.algo.advantage.estimator != "gae"
     ):

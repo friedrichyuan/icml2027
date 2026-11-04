@@ -373,7 +373,7 @@ class BaseRLTrainer:
             status.update(buffer.stats(self.learner_updates, picked))
             batch = balance_experiences([e.experience for e in picked], self.args)
             ray.get(self.actor_model_group.async_run_method_batch(method_name="append", experience=batch))
-            rounds.append(self.policy_train())
+            rounds.append(self.policy_train(replay=True))
             for e in picked:
                 e.uses += 1
             self.learner_updates += 1
@@ -553,7 +553,7 @@ class BaseRLTrainer:
         status["generated_samples"] = sample0
         return status, global_step + 1
 
-    def policy_train(self, train_actor: bool = True) -> Dict:
+    def policy_train(self, train_actor: bool = True, replay: bool = False) -> Dict:
         """Run one actor optimization step (then the critic) and return merged status.
 
         Sequential, not concurrent: colocated actor and critic share GPUs, so running
@@ -561,7 +561,9 @@ class BaseRLTrainer:
         a small no-overlap cost here. ``train_actor=False`` (critic warmup) skips the
         policy update but still drains the actor replay buffer.
         """
-        refs = self.actor_model_group.async_run_method(method_name="fit", kl_ctl=self.kl_ctl.value, train=train_actor)
+        refs = self.actor_model_group.async_run_method(
+            method_name="fit", kl_ctl=self.kl_ctl.value, train=train_actor, replay=replay
+        )
         status: dict = {}
         for result in ray.get(refs):
             status.update(result)

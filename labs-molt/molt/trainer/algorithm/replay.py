@@ -39,6 +39,16 @@ import ray
 from molt.trainer.algorithm.experience import Experience
 
 
+def hold_replay_step(dropped: float, seen: float, max_filter_ratio: float) -> bool:
+    """Skip the replay Adam step when the sequence gate rejects more than ``max_filter_ratio`` of it.
+
+    A negative cap disables the hold. ``seen == 0`` means this update has no sequence gate.
+    """
+    if max_filter_ratio < 0 or seen <= 0:
+        return False
+    return dropped / seen > max_filter_ratio
+
+
 @dataclass
 class ReplayEntry:
     experience: Experience  # heavy tensors local; advantages frozen at first use

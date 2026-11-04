@@ -13,7 +13,7 @@ import torch
 
 import molt.trainer.algorithm.replay as replay_mod
 from molt.trainer.algorithm.experience import Experience
-from molt.trainer.algorithm.replay import TrajectoryReplayBuffer, materialize
+from molt.trainer.algorithm.replay import TrajectoryReplayBuffer, hold_replay_step, materialize
 
 
 def _exp(tag):
@@ -22,6 +22,13 @@ def _exp(tag):
 
 def _ids(entries):
     return [e.experience.rollout_ids[0] for e in entries]
+
+
+def test_hold_skips_only_a_replay_batch_the_gate_mostly_rejects():
+    assert hold_replay_step(31, 100, 0.3) is True
+    assert hold_replay_step(30, 100, 0.3) is False
+    assert hold_replay_step(100, 100, -1) is False
+    assert hold_replay_step(0, 0, 0.3) is False
 
 
 def test_eviction_drops_stale_entries_then_the_oldest():

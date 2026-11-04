@@ -13,7 +13,8 @@
 #        tool Qwen2.5-7B-Instruct multi-turn Python tool (run_python_tool_dlc.sh)
 # Arms: A original Flash | B K=2 | C K=2+shrink | D K=2+optim_only | E K=1+shrink
 #       F K=1+optim_only | D_all / D_down D with the Adam reset on all params / MLP down_proj
-#       B4 K=4 | D4 K=4+optim_only
+#       B4 K=4 | D4 K=4+optim_only | hold D plus skip the replay Adam step when that batch's
+#       sequence-gate rejection exceeds 0.3 (the LR schedule still advances)
 # GPU / model overrides (CUDA_VISIBLE_DEVICES, VLLM_NUM_ENGINES, ACTOR_GPUS, MODEL) pass through
 # to the task launcher. Assumes the job owns its node: before every launch it kills leftover
 # Ray / vLLM processes and waits up to GPU_WAIT_MIN minutes for the GPUs to empty.
@@ -24,7 +25,7 @@ case "${TASK:-math}" in
   tool) launcher="$ROOT/scripts/run_python_tool_dlc.sh" run_prefix=qwen7b-tool ;;
   *) echo "unknown TASK=$TASK (math or tool)" >&2; exit 1 ;;
 esac
-ARM="${ARM:?set ARM to one of A B C D E F D_all D_down B4 D4}"
+ARM="${ARM:?set ARM to one of A B C D E F D_all D_down B4 D4 hold}"
 SEED="${SEED:-42}"
 STOP_STEP="${STOP_STEP:-400}"
 HANG_MIN="${HANG_MIN:-90}"
@@ -42,6 +43,7 @@ case "$ARM" in
   D_down) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*.down_proj.weight') ;;
   B4) flags=(--train.replay.update_ratio 4) ;;
   D4) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
+  hold) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.replay.max_filter_ratio 0.3) ;;
   *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac
 # free_gpus kills every Ray / vLLM process on the node, so a second launcher here would kill the

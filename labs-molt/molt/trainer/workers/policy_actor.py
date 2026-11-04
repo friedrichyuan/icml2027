@@ -32,6 +32,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from molt.models import Actor, PolicyLoss, agg_loss
+from molt.trainer.algorithm.replay import hold_replay_step
 from molt.models.utils import compute_approx_kl, masked_mean, mismatch_metrics, split_moe_aux_loss
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
 from molt.trainer.algorithm.length_weight import LengthWeight
@@ -278,7 +279,12 @@ class PolicyTrainer:
         status_list.append(merged_status)
         pbar.set_postfix(short_status)
 
-    def policy_train(self, kl_ctl: float):
+    def policy_train(self, kl_ctl: float, replay: bool = False):
+        # hold: a replay update whose sequence-gate rejection exceeds the cap must not step Adam
+        # (a zero-grad Adam step still applies momentum). The LR schedule still advances, so a held
+        # step occupies the same schedule index as replay D. The next replay batch is judged alone.
+        cap = getattr(self.args.train.replay, "max_filter_ratio", -1.0)
+        self._hold_cap = cap if replay else -1.0
         # replay buffer may be empty at first, we should rebuild at each training
         if self.args.train.dynamic_batch_enable:
             self.replay_buffer.setup_dynamic_batch(self.strategy)
@@ -365,6 +371,8 @@ class PolicyTrainer:
                     prompt_token_counts = [
                         torch.tensor([counts[key] for key in exp.group_ids], device=device) for exp in window
                     ]
+                self._hold_dropped = 0.0
+                self._hold_seen = 0.0
                 for idx, exp in enumerate(window):
                     exp.to_device(device)
                     # Full per-sequence lengths drive the FLOP estimate (forward
@@ -524,6 +532,10 @@ class PolicyTrainer:
             experience.info["vllm_kl"] = vllm_kl.detach()
         if is_filter_ratio is not None:
             experience.info["is_filter_ratio"] = is_filter_ratio.detach()
+            if getattr(self, "_hold_cap", -1.0) >= 0:
+                flat = is_filter_ratio.detach().float().flatten()
+                self._hold_dropped += float(flat.sum())
+                self._hold_seen += float(flat.numel())
         if rollout_log_probs is not None:
             experience.info.update(mismatch_metrics(rollout_log_probs, action_log_probs, action_mask))
         if rollout_top_log_probs is not None:
@@ -624,10 +636,20 @@ class PolicyTrainer:
         # every batching mode — grad-accum, dynamic token-budget, and
         # force-on-policy alike. Accumulate until then; step on the final
         # microbatch, where .grad is the fully reduced batch gradient.
-        if is_optimizer_step:
+        hold = False
+        if is_optimizer_step and getattr(self, "_hold_cap", -1.0) >= 0:
+            # Every rank must reduce: a rank that stepped while another held would desync Adam.
+            dropped = self.strategy.all_reduce(self._hold_dropped, op="sum")
+            seen = self.strategy.all_reduce(self._hold_seen, op="sum")
+            hold = hold_replay_step(dropped, seen, self._hold_cap)
+        if is_optimizer_step and not hold:
             self.strategy.optimizer_step(
                 self.actor_optim, self.actor, self.actor_scheduler, name="actor", accumulate=False
             )
+        elif hold:
+            self.actor_optim.zero_grad(set_to_none=True)
+            if self.actor_scheduler is not None:
+                self.actor_scheduler.step()
 
         # Stage 6: collect weighted metrics from this microbatch.
         metrics = {"policy_loss": reported_actor_loss.detach()}
@@ -646,13 +668,19 @@ class PolicyTrainer:
         weights["actor_lr"] = None
         # grad_norm is meaningful only on the optimizer-step microbatch, where
         # .grad is the fully reduced batch gradient.
-        if is_optimizer_step:
+        if is_optimizer_step and getattr(self, "_hold_cap", -1.0) >= 0:
+            metrics["step_skipped"] = float(hold)
+            weights["step_skipped"] = None
+        if is_optimizer_step and not hold:
             # True clip-time norm of the accumulated gradient. Normalization now
             # comes from the global token denominator (whole optimizer-step
             # batch), not a /accum factor, so after accumulation .grad is already
             # the correctly normalized batch gradient. This matches the value
             # clipped against max_norm and the grad_norm convention on wandb.
             metrics["actor_grad_norm"] = self.strategy.get_grad_norm(self.actor)
+            weights["actor_grad_norm"] = None
+        elif is_optimizer_step:
+            metrics["actor_grad_norm"] = 0.0
             weights["actor_grad_norm"] = None
 
         for k, v in experience.info.items():
@@ -991,7 +1019,7 @@ class PolicyModelActor(BaseModelActor):
             vllm_engines=self.vllm_engines,
         )
 
-    def fit(self, kl_ctl: float = 0, train: bool = True):
+    def fit(self, kl_ctl: float = 0, train: bool = True, replay: bool = False):
         """Train actor model with the replay buffer.
 
         ``train=False`` (critic warmup / actor freeze) skips the policy update but
@@ -1002,7 +1030,7 @@ class PolicyModelActor(BaseModelActor):
         status = {}
         if train:
             self.actor.train()
-            status = self.trainer.policy_train(kl_ctl)
+            status = self.trainer.policy_train(kl_ctl, replay=replay)
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
