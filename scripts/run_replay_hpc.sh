@@ -23,6 +23,8 @@
 #   replay4_adam_reset           K=4 + o_proj Adam reset
 #   replay2_adam_reset_hold      replay2_adam_reset, plus skip the replay Adam step when that
 #                                batch's sequence-gate rejection exceeds 0.3 (LR schedule advances)
+#   replay2_ppo_clip             K=2, replay updates clip each token's ratio to the rollout policy
+#                                (PPO, eps 0.2) instead of the IS gate; no Adam reset
 #   shrink / adam_reset          K=1 with the o_proj shrink / Adam reset
 # GPU / model overrides (CUDA_VISIBLE_DEVICES, VLLM_NUM_ENGINES, ACTOR_GPUS, MODEL) pass through
 # to the task launcher, and so do CODE_ROOT (checkout to train) and DATA_ROOT (weights, datasets,
@@ -56,6 +58,7 @@ case "$ARM" in
   replay4) flags=(--train.replay.update_ratio 4) ;;
   replay4_adam_reset) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
   replay2_adam_reset_hold) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.replay.max_filter_ratio 0.3) ;;
+  replay2_ppo_clip) flags=(--train.replay.update_ratio 2 --train.replay.ppo_clip) ;;
   *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac
 # free_gpus kills every Ray / vLLM process on the node, so a second launcher here would kill the

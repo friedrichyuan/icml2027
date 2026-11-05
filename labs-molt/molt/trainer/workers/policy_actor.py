@@ -285,6 +285,7 @@ class PolicyTrainer:
         # step occupies the same schedule index as replay D. The next replay batch is judged alone.
         cap = getattr(self.args.train.replay, "max_filter_ratio", -1.0)
         self._hold_cap = cap if replay else -1.0
+        self._replay_ppo_clip = replay and getattr(self.args.train.replay, "ppo_clip", False)
         # replay buffer may be empty at first, we should rebuild at each training
         if self.args.train.dynamic_batch_enable:
             self.replay_buffer.setup_dynamic_batch(self.strategy)
@@ -478,7 +479,12 @@ class PolicyTrainer:
             **multimodal_inputs,
         )
         action_log_probs = model_output["action_log_probs"]
-        if old_action_log_probs is None:
+        ppo_clip = getattr(self, "_replay_ppo_clip", False)
+        if ppo_clip:
+            # --train.replay.ppo_clip: a replayed trajectory is measured against the policy that
+            # sampled it, so PPO's clip bounds its drift since sampling (ratio 1 would never clip).
+            old_action_log_probs = rollout_log_probs
+        elif old_action_log_probs is None:
             # force_on_policy: experience_maker skipped the redundant old-logprob forward.
             # The batch is trained for one on-policy step, so old == this forward -> PPO
             # ratio 1 -> REINFORCE gradient; the IS correction still runs vs rollout_log_probs.
@@ -525,6 +531,7 @@ class PolicyTrainer:
             rollout_top_log_probs=rollout_top_log_probs,
             # T_i: the row's original policy-token count, before the IS gate drops any token.
             seq_weights=self.length_weight(action_mask.sum(-1)) if self.length_weight is not None else None,
+            is_correction=not ppo_clip,
         )
         experience.info["policy_clip_ratio"] = clip_ratio.detach()
         experience.info["policy_kl"] = policy_kl.detach()

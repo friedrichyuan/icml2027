@@ -963,6 +963,14 @@ if __name__ == "__main__":
         "replay batch (-1 = off). The LR schedule still advances. Strategy hold uses 0.3.",
     )
     parser.add_argument(
+        "--train.replay.ppo_clip",
+        action="store_true",
+        default=False,
+        help="Replay updates take the rollout log-probs as PPO's old log-probs, so the ratio clip bounds each "
+        "token's drift since sampling, and skip the vLLM-IS gate and weight (the same ratio, applied twice "
+        "otherwise). Fresh updates are unchanged.",
+    )
+    parser.add_argument(
         "--train.reset.mode",
         choices=["off", "shrink", "optim_only"],
         default="off",
@@ -1404,6 +1412,14 @@ if __name__ == "__main__":
     cap = args.train.replay.max_filter_ratio
     if cap > 1 or (cap < 0 and cap != -1):
         raise ValueError("--train.replay.max_filter_ratio must be in [0, 1], or -1 to disable the hold.")
+    if args.train.replay.ppo_clip and (
+        args.train.replay.update_ratio < 2 or args.algo.advantage.is_correction_level == "off" or cap >= 0
+    ):
+        # The rollout log-probs are only collected for the IS correction, and the hold reads the
+        # IS gate that ppo_clip skips on replay, so it would never fire.
+        raise ValueError(
+            "--train.replay.ppo_clip needs --train.replay.update_ratio >= 2, an IS correction level, and no hold."
+        )
     if args.train.replay.update_ratio > 1 and not (
         args.train.force_on_policy and args.algo.kl.init_coef == 0 and args.algo.advantage.estimator != "gae"
     ):

@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import molt.trainer.algorithm.replay as replay_mod
+from molt.models.loss import PolicyLoss
 from molt.trainer.algorithm.experience import Experience
 from molt.trainer.algorithm.replay import TrajectoryReplayBuffer, hold_replay_step, materialize
 
@@ -22,6 +23,29 @@ def _exp(tag):
 
 def _ids(entries):
     return [e.experience.rollout_ids[0] for e in entries]
+
+
+def test_ppo_clip_replay_clips_against_the_rollout_policy_without_the_gate():
+    # Token 0 drifted since sampling (ratio e^0.5 > 1.2), token 1 did not. The recipe's seq
+    # binary-KL gate drops the whole sequence; ppo_clip instead keeps it as plain PPO vs the rollout.
+    log_p = torch.tensor([[0.0, -1.0]], requires_grad=True)
+    rollout = torch.tensor([[-0.5, -1.0]])
+    adv, mask = torch.ones(1, 2), torch.ones(1, 2, dtype=torch.bool)
+    recipe = PolicyLoss(
+        is_correction_level="seq", is_correction_gating="binary_kl", is_correction_threshold=[float("-inf"), 3e-3]
+    )
+    *_, filtered = recipe(log_p, log_p.detach(), adv, action_mask=mask, rollout_log_probs=rollout)
+    assert filtered.tolist() == [1.0]
+
+    loss, _, clip_ratio, _, vllm_kl, filtered = recipe(
+        log_p, rollout, adv, action_mask=mask, rollout_log_probs=rollout, is_correction=False
+    )
+    plain, *_ = PolicyLoss()(log_p, rollout, adv, action_mask=mask)
+    assert vllm_kl is None and filtered is None
+    assert clip_ratio.item() == 0.5
+    torch.testing.assert_close(loss, plain)
+    loss.backward()
+    assert log_p.grad[0, 0] == 0 and log_p.grad[0, 1] != 0  # the clipped token takes no gradient
 
 
 def test_hold_skips_only_a_replay_batch_the_gate_mostly_rejects():
@@ -237,6 +261,7 @@ def _cli(*flags):
         (["--train.replay.update_ratio", "0"], "update_ratio must be >= 1"),
         (["--train.reset.mode", "shrink", "--train.reset.eps", "0"], "eps must be in (0, 1]"),
         (["--train.reset.mode", "optim_only", "--actor.lora_dim", "8"], "full-parameter FSDP"),
+        (["--train.replay.ppo_clip"], "--train.replay.ppo_clip needs"),
     ],
 )
 def test_cli_rejects_unsupported_replay_and_reset_configs(flags, message):

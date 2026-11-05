@@ -372,11 +372,14 @@ class PolicyLoss(nn.Module):
         top_log_probs: Optional[torch.Tensor] = None,
         rollout_top_log_probs: Optional[torch.Tensor] = None,
         seq_weights: Optional[torch.Tensor] = None,
+        is_correction: bool = True,
     ) -> torch.Tensor:
         """``top_log_probs`` / ``rollout_top_log_probs`` are ``[B, T-1, k]``: the trained policy's and
         the sampler's log-probs of the sampler's top-k ids per step (score centering only).
         ``seq_weights`` ``[B]`` (detached) scales each sequence's policy-gradient term before the
-        aggregation, which keeps its token and batch denominators (``--algo.length_weight``)."""
+        aggregation, which keeps its token and batch denominators (``--algo.length_weight``).
+        ``is_correction=False`` skips the vLLM-IS gate and weight for a call whose old log-probs
+        already are the rollout's (``--train.replay.ppo_clip``)."""
         log_ratio_limit = 30.0
         policy_log_ratio = torch.nan_to_num(
             log_probs.float() - old_log_probs.float(),
@@ -404,7 +407,7 @@ class PolicyLoss(nn.Module):
 
         vllm_kl = None
         is_filter_ratio = None
-        if self.is_correction_level != "off":
+        if self.is_correction_level != "off" and is_correction:
             if rollout_log_probs is None:
                 raise ValueError("rollout_log_probs is required when IS correction is enabled")
             low, high = self.is_correction_threshold
