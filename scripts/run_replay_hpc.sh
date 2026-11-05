@@ -5,27 +5,38 @@
 # (train.log silent for HANG_MIN, e.g. a lost eval request) resumes from $OUT/state, and so does
 # re-submitting the same command after a preemption.
 #
-#   ARM=D SEED=1 bash scripts/run_replay_hpc.sh
-#   ARM=B SEED=2 STOP_STEP=400 bash scripts/run_replay_hpc.sh [extra train flags]
-#   TASK=tool ARM=D SEED=42 STOP_STEP=600 bash scripts/run_replay_hpc.sh
+#   ARM=replay2_adam_reset SEED=1 bash scripts/run_replay_hpc.sh
+#   ARM=replay2 SEED=2 STOP_STEP=400 bash scripts/run_replay_hpc.sh [extra train flags]
+#   TASK=tool ARM=replay2_adam_reset SEED=42 STOP_STEP=600 bash scripts/run_replay_hpc.sh
 #
-# Tasks: math Qwen2.5-Math-1.5B (run_qwen_math_dlc.sh, default)
-#        tool Qwen2.5-7B-Instruct multi-turn Python tool (run_python_tool_dlc.sh)
-# Arms: A original Flash | B K=2 | C K=2+shrink | D K=2+optim_only | E K=1+shrink
-#       F K=1+optim_only | D_all / D_down D with the Adam reset on all params / MLP down_proj
-#       B4 K=4 | D4 K=4+optim_only | hold D plus skip the replay Adam step when that batch's
-#       sequence-gate rejection exceeds 0.3 (the LR schedule still advances)
+# Tasks (output dir): math Qwen2.5-Math-1.5B, run_qwen_math_dlc.sh (outputs/Qwen-Math-1.5B, default)
+#                     tool Qwen2.5-7B-Instruct multi-turn Python tool, run_python_tool_dlc.sh
+#                          (outputs/Qwen-7B-Tool)
+# Arms land in $DATA_ROOT/outputs/<task dir>/<arm>_s<seed>. K = actor updates per new batch.
+#   flash                        original FlashREINFORCE
+#   flash_lr2e-6                 flash with 2x the Adam LR (does replay gain more than extra steps?)
+#   replay2 / replay4            K=2 / K=4
+#   replay2_shrink               K=2 + shrink o_proj toward its RL-start weights
+#   replay2_adam_reset           K=2 + reset the o_proj Adam moments
+#   replay2_adam_reset_all       same reset on all params
+#   replay2_adam_reset_down_proj same reset on MLP down_proj
+#   replay4_adam_reset           K=4 + o_proj Adam reset
+#   replay2_adam_reset_hold      replay2_adam_reset, plus skip the replay Adam step when that
+#                                batch's sequence-gate rejection exceeds 0.3 (LR schedule advances)
+#   shrink / adam_reset          K=1 with the o_proj shrink / Adam reset
 # GPU / model overrides (CUDA_VISIBLE_DEVICES, VLLM_NUM_ENGINES, ACTOR_GPUS, MODEL) pass through
-# to the task launcher. Assumes the job owns its node: before every launch it kills leftover
-# Ray / vLLM processes and waits up to GPU_WAIT_MIN minutes for the GPUs to empty.
+# to the task launcher, and so do CODE_ROOT (checkout to train) and DATA_ROOT (weights, datasets,
+# outputs), see run_qwen_math_dlc.sh. Assumes the job owns its node: before every launch it kills
+# leftover Ray / vLLM processes and waits up to GPU_WAIT_MIN minutes for the GPUs to empty.
 set -uo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export CODE_ROOT="${CODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export DATA_ROOT="${DATA_ROOT:-$CODE_ROOT}"
 case "${TASK:-math}" in
-  math) launcher="$ROOT/scripts/run_qwen_math_dlc.sh" run_prefix=qwen-math-1.5b ;;
-  tool) launcher="$ROOT/scripts/run_python_tool_dlc.sh" run_prefix=qwen7b-tool ;;
+  math) launcher="$CODE_ROOT/scripts/run_qwen_math_dlc.sh" task_dir=Qwen-Math-1.5B ;;
+  tool) launcher="$CODE_ROOT/scripts/run_python_tool_dlc.sh" task_dir=Qwen-7B-Tool ;;
   *) echo "unknown TASK=$TASK (math or tool)" >&2; exit 1 ;;
 esac
-ARM="${ARM:?set ARM to one of A B C D E F D_all D_down B4 D4 hold}"
+ARM="${ARM:?set ARM to one of the arms listed at the top of this script}"
 SEED="${SEED:-42}"
 STOP_STEP="${STOP_STEP:-400}"
 HANG_MIN="${HANG_MIN:-90}"
@@ -33,17 +44,18 @@ MAX_RESTARTS="${MAX_RESTARTS:-3}"
 GPU_WAIT_MIN="${GPU_WAIT_MIN:-10}"
 
 case "$ARM" in
-  A) flags=() ;;
-  B) flags=(--train.replay.update_ratio 2) ;;
-  C) flags=(--train.replay.update_ratio 2 --train.reset.mode shrink --train.reset.eps 0.01) ;;
-  D) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only) ;;
-  E) flags=(--train.reset.mode shrink --train.reset.eps 0.01) ;;
-  F) flags=(--train.reset.mode optim_only) ;;
-  D_all) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*') ;;
-  D_down) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*.down_proj.weight') ;;
-  B4) flags=(--train.replay.update_ratio 4) ;;
-  D4) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
-  hold) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.replay.max_filter_ratio 0.3) ;;
+  flash) flags=() ;;
+  flash_lr2e-6) flags=(--actor.adam.lr 2e-6) ;;
+  replay2) flags=(--train.replay.update_ratio 2) ;;
+  replay2_shrink) flags=(--train.replay.update_ratio 2 --train.reset.mode shrink --train.reset.eps 0.01) ;;
+  replay2_adam_reset) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only) ;;
+  shrink) flags=(--train.reset.mode shrink --train.reset.eps 0.01) ;;
+  adam_reset) flags=(--train.reset.mode optim_only) ;;
+  replay2_adam_reset_all) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*') ;;
+  replay2_adam_reset_down_proj) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.reset.params '*.down_proj.weight') ;;
+  replay4) flags=(--train.replay.update_ratio 4) ;;
+  replay4_adam_reset) flags=(--train.replay.update_ratio 4 --train.reset.mode optim_only) ;;
+  replay2_adam_reset_hold) flags=(--train.replay.update_ratio 2 --train.reset.mode optim_only --train.replay.max_filter_ratio 0.3) ;;
   *) echo "unknown ARM=$ARM" >&2; exit 1 ;;
 esac
 # free_gpus kills every Ray / vLLM process on the node, so a second launcher here would kill the
@@ -56,7 +68,7 @@ if ! flock -n 9; then
 fi
 echo "$ARM seed $SEED pid $$ since $(date '+%F %T')" > "$lock.owner"
 
-export OUT="${OUT:-$ROOT/outputs/${run_prefix}-replay_${ARM}_s${SEED}}"
+export OUT="${OUT:-$DATA_ROOT/outputs/$task_dir/${ARM}_s${SEED}}"
 mkdir -p "$OUT"
 log="$OUT/train.log"
 

@@ -2,15 +2,19 @@
 # FlashREINFORCE Qwen2.5-Math-1.5B on a DLC node that already runs the molt image.
 # No docker wrapper: this script is the container entrypoint.
 #
-#   ROOT=/mnt/data/yuanmingqi/code/icml2027 bash scripts/run_qwen_math_dlc.sh
-#   OUT=outputs/qwen-math-1.5b-lw_a0.75 bash scripts/run_qwen_math_dlc.sh --algo.length_weight.enabled ...
+#   bash scripts/run_qwen_math_dlc.sh
+#   CODE_ROOT=/path/to/icml2027 DATA_ROOT=/path/to/data_root bash /path/to/icml2027/scripts/run_qwen_math_dlc.sh
 #
-# Defaults: 8 visible GPUs (0-7), 4 vLLM + 4 actor; model under $ROOT or $ROOT/data,
-# datasets under $ROOT/data/qwen-math or $ROOT/qwen-math.
+# CODE_ROOT is the checkout whose labs-molt is trained (default: the one holding this script);
+# DATA_ROOT holds the weights, datasets and outputs/ (default: CODE_ROOT). Both pass through
+# run_replay_hpc.sh and scripts/hpc/*.sh, so every job on a node trains the same checkout.
+# Defaults: 8 visible GPUs (0-7), 4 vLLM + 4 actor; model under $DATA_ROOT or $DATA_ROOT/data,
+# datasets under $DATA_ROOT/data/qwen-math or $DATA_ROOT/qwen-math.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="${PYTHONPATH:-}:${ROOT}/labs-molt"
+export CODE_ROOT="${CODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+export DATA_ROOT="${DATA_ROOT:-$CODE_ROOT}"
+export PYTHONPATH="${PYTHONPATH:-}:${CODE_ROOT}/labs-molt"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export TOKENIZERS_PARALLELISM=true
@@ -29,10 +33,10 @@ export VLLM_NUM_ENGINES="${VLLM_NUM_ENGINES:-4}"
 export ACTOR_GPUS="${ACTOR_GPUS:-4}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
-# Weights and datasets may sit directly under $ROOT (HPC) or under $ROOT/data (DLC).
+# Weights and datasets may sit directly under $DATA_ROOT (HPC) or under $DATA_ROOT/data (DLC).
 # Prefer the ctx8192 wrapper; fall back to a plain Qwen2.5-Math-1.5B tree.
 if [ -z "${MODEL:-}" ]; then
-  for base in "$ROOT/data/models" "$ROOT/data" "$ROOT/models" "$ROOT"; do
+  for base in "$DATA_ROOT/data/models" "$DATA_ROOT/data" "$DATA_ROOT/models" "$DATA_ROOT"; do
     for name in Qwen2.5-Math-1.5B-ctx8192 Qwen2.5-Math-1.5B; do
       candidate="$base/$name"
       if [ -e "$candidate/config.json" ] || [ -e "$candidate/model.safetensors" ] || [ -e "$candidate/model.safetensors.index.json" ]; then
@@ -42,31 +46,37 @@ if [ -z "${MODEL:-}" ]; then
     done
   done
 fi
-: "${MODEL:?set MODEL to the Qwen2.5-Math-1.5B directory (looked under $ROOT and $ROOT/data)}"
+: "${MODEL:?set MODEL to the Qwen2.5-Math-1.5B directory (looked under $DATA_ROOT and $DATA_ROOT/data)}"
 # Stock Qwen2.5-Math-1.5B caps context at 4096 but the recipe needs prompt + 4096 new tokens:
 # wrap it like the local ctx8192 tree (weights symlinked, only the two window fields raised).
+# Built once in a temp dir and renamed into place, so concurrent launches never see a
+# half-written config or a missing weight link; the loser of a race discards its copy.
 if [ -e "$MODEL/config.json" ] && python - "$MODEL/config.json" << 'PY'
 import json, sys
 sys.exit(0 if json.load(open(sys.argv[1])).get("max_position_embeddings", 0) < 8192 else 1)
 PY
 then
-  wrapped="$ROOT/outputs/models/$(basename "$MODEL")-ctx8192"
-  mkdir -p "$wrapped"
-  for f in "$MODEL"/*; do
-    [ "$(basename "$f")" = config.json ] || ln -sfn "$(readlink -f "$f")" "$wrapped/$(basename "$f")"
-  done
-  python - "$MODEL/config.json" "$wrapped/config.json" << 'PY'
+  wrapped="$DATA_ROOT/outputs/models/$(basename "$MODEL")-ctx8192"
+  if [ ! -e "$wrapped/config.json" ]; then
+    mkdir -p "$(dirname "$wrapped")"
+    tmp="$(mktemp -d "$wrapped.tmp.XXXXXX")"
+    for f in "$MODEL"/*; do
+      [ "$(basename "$f")" = config.json ] || ln -s "$(readlink -f "$f")" "$tmp/$(basename "$f")"
+    done
+    python - "$MODEL/config.json" "$tmp/config.json" << 'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 cfg["max_position_embeddings"] = 8192
 cfg["sliding_window"] = 8192
 json.dump(cfg, open(sys.argv[2], "w"), indent=2)
 PY
-  echo "wrapped $MODEL -> $wrapped (context 8192)"
+    mv -T "$tmp" "$wrapped" 2>/dev/null || rm -rf "$tmp"
+    echo "wrapped $MODEL -> $wrapped (context 8192)"
+  fi
   MODEL="$wrapped"
 fi
 if [ -z "${TRAIN:-}" ] || [ -z "${EVAL:-}" ]; then
-  for base in "$ROOT/data/qwen-math" "$ROOT/qwen-math"; do
+  for base in "$DATA_ROOT/data/qwen-math" "$DATA_ROOT/qwen-math"; do
     if [ -e "$base/train" ] && [ -e "$base/eval" ]; then
       TRAIN="${TRAIN:-$base/train}"
       EVAL="${EVAL:-$base/eval}"
@@ -74,9 +84,9 @@ if [ -z "${TRAIN:-}" ] || [ -z "${EVAL:-}" ]; then
     fi
   done
 fi
-: "${TRAIN:?set TRAIN to the qwen-math train dataset (looked under $ROOT and $ROOT/data)}"
-: "${EVAL:?set EVAL to the qwen-math eval dataset (looked under $ROOT and $ROOT/data)}"
-OUT="${OUT:-$ROOT/outputs/qwen-math-1.5b}"
+: "${TRAIN:?set TRAIN to the qwen-math train dataset (looked under $DATA_ROOT and $DATA_ROOT/data)}"
+: "${EVAL:?set EVAL to the qwen-math eval dataset (looked under $DATA_ROOT and $DATA_ROOT/data)}"
+OUT="${OUT:-$DATA_ROOT/outputs/Qwen-Math-1.5B/flash}"
 mkdir -p "$OUT"
 
 for path in "$MODEL" "$TRAIN" "$EVAL"; do
@@ -85,11 +95,11 @@ done
 # Soft links into /data/models break on DLC if that host path is absent.
 if [ -L "$MODEL/model.safetensors" ] && [ ! -e "$MODEL/model.safetensors" ]; then
   echo "broken weight symlink: $MODEL/model.safetensors -> $(readlink "$MODEL/model.safetensors")" >&2
-  echo "put a real Qwen2.5-Math-1.5B tree under $ROOT/data (or set MODEL=...)" >&2
+  echo "put a real Qwen2.5-Math-1.5B tree under $DATA_ROOT/data (or set MODEL=...)" >&2
   exit 1
 fi
 
-echo "ROOT=$ROOT MODEL=$MODEL OUT=$OUT CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" | tee -a "$OUT/train.log"
+echo "CODE_ROOT=$CODE_ROOT DATA_ROOT=$DATA_ROOT MODEL=$MODEL OUT=$OUT CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" | tee -a "$OUT/train.log"
 
 if ray status >/dev/null 2>&1; then
   echo "A Ray cluster is already running; refusing to join it." >&2
@@ -102,7 +112,7 @@ ulimit -n 1048576 2>/dev/null || true
 ray start --head --num-gpus="$((VLLM_NUM_ENGINES + ACTOR_GPUS))" --disable-usage-stats
 trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
 
-cd "$ROOT/labs-molt"
+cd "$CODE_ROOT/labs-molt"
 python -u -m molt.cli.train_rl_ray \
   --actor.model_name_or_path "$MODEL" \
   --data.prompt_dataset "$TRAIN" \
@@ -151,7 +161,7 @@ python -u -m molt.cli.train_rl_ray \
   --algo.advantage.is_correction_gating binary_kl \
   --algo.advantage.is_correction_threshold 3e-3 \
   --algo.kl.init_coef 0 \
-  --train.agent_path "$ROOT/labs-molt/examples/python/agents/math.py" \
+  --train.agent_path "$CODE_ROOT/labs-molt/examples/python/agents/math.py" \
   --eval.dataset "$EVAL" \
   --eval.steps 100 \
   --eval.batch_size 8 \

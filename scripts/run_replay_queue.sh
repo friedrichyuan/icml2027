@@ -2,7 +2,9 @@
 # Run the replay / reset arms one after another on the docker recipe, each until its eval at
 # STOP_STEP lands. A run whose train.log is silent for HANG_MIN minutes (e.g. an eval request
 # that never returns) or that dies early is resumed from its latest checkpoint.
-#   STOP_STEP=400 setsid nohup scripts/run_replay_queue.sh B C D E > outputs/replay_queue.log 2>&1 &
+# Arm names match scripts/run_replay_hpc.sh; each lands in outputs/Qwen-Math-1.5B/<arm>.
+#   STOP_STEP=400 setsid nohup scripts/run_replay_queue.sh replay2 replay2_adam_reset \
+#     > outputs/replay_queue.log 2>&1 &
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STOP_STEP="${STOP_STEP:-400}"
@@ -11,18 +13,19 @@ MAX_RESTARTS="${MAX_RESTARTS:-3}"
 
 flags_for() {
   case "$1" in
-    B) echo "--train.replay.update_ratio 2" ;;
-    C) echo "--train.replay.update_ratio 2 --train.reset.mode shrink --train.reset.eps 0.01" ;;
-    D) echo "--train.replay.update_ratio 2 --train.reset.mode optim_only" ;;
-    E) echo "--train.reset.mode shrink --train.reset.eps 0.01" ;;
-    B4) echo "--train.replay.update_ratio 4" ;;
+    flash_lr2e-6) echo "--actor.adam.lr 2e-6" ;;
+    replay2) echo "--train.replay.update_ratio 2" ;;
+    replay2_shrink) echo "--train.replay.update_ratio 2 --train.reset.mode shrink --train.reset.eps 0.01" ;;
+    replay2_adam_reset) echo "--train.replay.update_ratio 2 --train.reset.mode optim_only" ;;
+    shrink) echo "--train.reset.mode shrink --train.reset.eps 0.01" ;;
+    replay4) echo "--train.replay.update_ratio 4" ;;
     *) echo "unknown arm $1" >&2; return 1 ;;
   esac
 }
 
 for arm in "$@"; do
   flags="$(flags_for "$arm")" || exit 1
-  out="$ROOT/outputs/qwen-math-1.5b-replay_$arm"
+  out="$ROOT/outputs/Qwen-Math-1.5B/$arm"
   name="frl-replay-$arm"
   restarts=0
   resume=""

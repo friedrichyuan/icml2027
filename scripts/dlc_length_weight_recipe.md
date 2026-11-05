@@ -1,10 +1,11 @@
 # DLC: fixed length-weight ablation (FlashREINFORCE, Qwen2.5-Math-1.5B)
 
-Code root on the node: `/mnt/data/yuanmingqi/code/icml2027`.  
+Code root on the node: `/mnt/data/yuanmingqi/code/icml2027` (override with `CODE_ROOT=...`; weights,
+datasets and outputs live under `DATA_ROOT`, which defaults to `CODE_ROOT`).  
 The job already runs inside the molt image — use the `*_dlc.sh` scripts, not the docker wrappers.
 
-Weights must resolve under `$ROOT/data` (set `MODEL=...` if the directory name differs).  
-Prompt/eval datasets: `$ROOT/data/qwen-math/{train,eval}`.
+Weights must resolve under `$DATA_ROOT/data` (set `MODEL=...` if the directory name differs).  
+Prompt/eval datasets: `$DATA_ROOT/data/qwen-math/{train,eval}`.
 
 Each full arm is ~33 h on 8 GPUs (4 vLLM + 4 actor).
 
@@ -37,7 +38,7 @@ ALPHA=0.75 bash scripts/run_length_weight_dlc.sh   # up-weight long
 ALPHA=1.25 bash scripts/run_length_weight_dlc.sh   # down-weight long
 ```
 
-Outputs land in `outputs/qwen-math-1.5b-lw_a{1.0,0.75,1.25}/`.  
+Outputs land in `outputs/Qwen-Math-1.5B/length_weight_a{1.0,0.75,1.25}/`.  
 Startup log should contain a line like:
 `[LengthWeight] alpha=... T0=... c=... reference=...`
 
@@ -54,9 +55,9 @@ ALPHA=0.75 REF=refs/flash_len.json bash scripts/run_length_weight_dlc.sh \
 
 ```bash
 python scripts/compare_runs.py \
-  outputs/qwen-math-1.5b-lw_a1.0 \
-  outputs/qwen-math-1.5b-lw_a0.75 \
-  outputs/qwen-math-1.5b-lw_a1.25 \
+  outputs/Qwen-Math-1.5B/length_weight_a1.0 \
+  outputs/Qwen-Math-1.5B/length_weight_a0.75 \
+  outputs/Qwen-Math-1.5B/length_weight_a1.25 \
   --budget_tokens 2000
 ```
 
@@ -70,4 +71,5 @@ ls data/models/*/config.json data/qwen-math/train data/qwen-math/eval
 OUT=outputs/smoke bash scripts/run_qwen_math_dlc.sh --train.num_episodes 1 --data.max_samples 256
 ```
 
-`CUDA_VISIBLE_DEVICES`, `VLLM_NUM_ENGINES`, `ACTOR_GPUS`, `MODEL`, `OUT` are all overridable env vars.
+`CODE_ROOT`, `DATA_ROOT`, `CUDA_VISIBLE_DEVICES`, `VLLM_NUM_ENGINES`, `ACTOR_GPUS`, `MODEL`, `OUT` are all
+overridable env vars.
